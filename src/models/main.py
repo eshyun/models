@@ -2844,7 +2844,10 @@ class ModelsTUI(App):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "query":
-            self._applied_query = event.value
+            value = event.value or ""
+            if value.strip().startswith("/"):
+                return
+            self._applied_query = value
             self._refresh_table()
             self._update_palette()
 
