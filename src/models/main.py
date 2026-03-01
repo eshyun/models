@@ -1,4 +1,7 @@
 import json
+import os
+import time
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import typer
 import click
@@ -30,6 +33,53 @@ class ModelDataFetcher:
     def __init__(self):
         self._raw_data: Optional[dict] = None
         self._df: Optional[fd.DataFrame] = None
+
+    def _cache_path(self) -> Path:
+        configured = (os.environ.get("MODELS_CACHE_PATH") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return Path.home() / ".cache" / "models" / "api.json"
+
+    def _cache_ttl_seconds(self) -> int:
+        raw = (os.environ.get("MODELS_CACHE_TTL_SECONDS") or "").strip()
+        if not raw:
+            return 60 * 60 * 24
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return 60 * 60 * 24
+
+    def _read_cache(self) -> Optional[Dict[str, Any]]:
+        path = self._cache_path()
+        try:
+            if not path.exists():
+                return None
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _cache_is_fresh(self) -> bool:
+        path = self._cache_path()
+        ttl = self._cache_ttl_seconds()
+        if ttl <= 0:
+            return False
+        try:
+            if not path.exists():
+                return False
+            age = time.time() - path.stat().st_mtime
+            return age <= ttl
+        except Exception:
+            return False
+
+    def _write_cache(self, data: Dict[str, Any]) -> None:
+        path = self._cache_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            return
     
     def fetch_data(self) -> Dict[str, Any]:
         """
@@ -41,15 +91,28 @@ class ModelDataFetcher:
         Raises:
             requests.RequestException: If the API request fails.
         """
+        if self._cache_is_fresh():
+            cached = self._read_cache()
+            if cached is not None:
+                self._raw_data = cached
+                return self._raw_data
+
         url = urljoin(self.BASE_URL, self.API_ENDPOINT)
 
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        self._raw_data = response.json()
-        
-
-        
-        return self._raw_data
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            self._raw_data = response.json()
+            if isinstance(self._raw_data, dict):
+                self._write_cache(self._raw_data)
+            return self._raw_data
+        except requests.RequestException:
+            cached = self._read_cache()
+            if cached is not None:
+                typer.echo("Warning: failed to fetch remote data; using cached data.", err=True)
+                self._raw_data = cached
+                return self._raw_data
+            raise
     
     def _flatten_model_data(self, provider: str, model_id: str, model_data: Dict) -> Dict:
         """Flatten the model data structure for easier analysis.
@@ -231,19 +294,31 @@ def resolve_column_alias(column: str, available_columns: List[str]) -> str:
     Returns:
         The resolved column name if found, otherwise the original column name
     """
+    key = (column or "").strip().lower()
     # Define aliases mapping
     aliases = {
-        'cost_input_per_million': 'input_cost',
-        'cost_output_per_million': 'output_cost',
-        'cost_cache_read': 'cost_cache_read_per_million',
-        'name': 'model_name',
-        'id': 'model_id'
+        "id": "model_id",
+        "name": "model_name",
+        "input": "input_cost",
+        "output": "output_cost",
+        "context": "context_window",
+        "tokens": "max_output_tokens",
+        "max_tokens": "max_output_tokens",
+        "cost_input_per_million": "input_cost",
+        "cost_output_per_million": "output_cost",
+        "cost_cache_read": "cost_cache_read_per_million",
     }
     
     # Check if the column is an alias
-    if column in aliases and aliases[column] in available_columns:
-        return aliases[column]
-    return column
+    if key in aliases and aliases[key] in available_columns:
+        return aliases[key]
+
+    # Fallback: if caller already gave a valid column, preserve original casing
+    normalized = {c.lower(): c for c in available_columns}
+    if key in normalized:
+        return normalized[key]
+
+    return (column or "").strip()
 
 def format_context_window(value: int) -> str:
     """Format context window value to human-readable format (K or M)."""
@@ -326,7 +401,27 @@ def resolve_rich_table_box(style: Optional[str]) -> Optional[box.Box]:
 
 
 def _normalize_query(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
+    """Normalize user/model text for fuzzy matching.
+
+    LLM model ids/names frequently use separators like '-', '/', '_' and embed version
+    numbers. We normalize those patterns so queries like 'gemini3 flash' match
+    'gemini-3-flash' and 'Gemini 3 Flash' consistently.
+    """
+    import re
+
+    raw = (s or "").strip().lower()
+    if not raw:
+        return ""
+
+    # Treat common separators as whitespace (model ids often use them as token boundaries).
+    raw = re.sub(r"[-_/]+", " ", raw)
+
+    # Split letter<->digit boundaries to help versioned names (e.g. gemini3 -> gemini 3).
+    raw = re.sub(r"([a-z])([0-9])", r"\1 \2", raw)
+    raw = re.sub(r"([0-9])([a-z])", r"\1 \2", raw)
+
+    # Collapse whitespace.
+    return " ".join(raw.split())
 
 
 def _match_rank(query: str, text: str) -> Tuple[int, int]:
@@ -377,14 +472,143 @@ def _match_rank_for_field(query: str, text: str, field: str, advanced_fuzzy: boo
     if tokens and all(tok in t for tok in tokens):
         return (3, 85)
 
+    # LLM naming heuristic:
+    # If the query contains alphabetic tokens (e.g. "gemini", "flash") and the
+    # candidate contains none of those tokens, treat it as irrelevant.
+    # This prevents numeric-only accidental matches (e.g. matching just "3").
+    alpha_tokens = [tok for tok in tokens if any(ch.isalpha() for ch in tok)]
+    if alpha_tokens:
+        alpha_hits = sum(1 for tok in alpha_tokens if tok in t)
+        if alpha_hits == 0:
+            return (4, 0)
+
+    # Weighted token heuristics for LLM naming:
+    # - Primary alphabetic token (usually the first alphabetic token) is most important (e.g. "gemini").
+    # - Numeric tokens (versions like "3", "2.5") are next.
+    # - Remaining alphabetic tokens (e.g. "flash", "preview") are next.
+    import re
+    primary_alpha: Optional[str] = next((tok for tok in tokens if any(ch.isalpha() for ch in tok)), None)
+    numeric_tokens = [tok for tok in tokens if re.fullmatch(r"\d+(?:\.\d+)?", tok or "")]
+
+    # If the user explicitly specifies a lineup / variant token (flash/pro/mini/etc),
+    # treat it as a strong preference and penalize candidates that don't contain it.
+    # This helps queries like "gemini3 flash" prioritize Flash variants over Pro.
+    variant_keywords = {
+        "flash",
+        "pro",
+        "mini",
+        "lite",
+        "preview",
+        "experimental",
+        "exp",
+        "turbo",
+    }
+    specified_variants = [tok for tok in tokens if tok in variant_keywords]
+    variant_hits = sum(1 for tok in specified_variants if tok in t) if specified_variants else 0
+
+    # Candidate numeric tokens (already normalized / split).
+    candidate_numeric_tokens = [tok for tok in t.split(" ") if re.fullmatch(r"\d+(?:\.\d+)?", tok or "")]
+
+    def _version_proximity_bonus(q_versions: List[str], cand_versions: List[str]) -> int:
+        """Compute a bonus based on how close the candidate version tokens are.
+
+        Exact token matches get the strongest boost.
+        Same-major matches (e.g. 3 vs 3.1) get a smaller boost.
+        """
+        if not q_versions or not cand_versions:
+            return 0
+
+        bonus = 0
+        cand_set = set(cand_versions)
+        cand_floats: List[float] = []
+        for v in cand_versions:
+            try:
+                cand_floats.append(float(v))
+            except Exception:
+                continue
+
+        for qv in q_versions:
+            # Exact token match ("3" == "3")
+            if qv in cand_set:
+                bonus += 12
+                continue
+
+            # Same-major match ("3" vs "3.1")
+            try:
+                qf = float(qv)
+                q_major = int(qf)
+            except Exception:
+                continue
+
+            same_major = False
+            for cf in cand_floats:
+                if int(cf) == q_major:
+                    same_major = True
+                    break
+            if same_major:
+                bonus += 6
+                continue
+
+            # Otherwise: no bonus
+
+        return bonus
+
+    primary_hit = 1 if (primary_alpha and primary_alpha in t) else 0
+    numeric_hits = sum(1 for tok in numeric_tokens if tok in t)
+    other_alpha_hits = 0
+    for tok in tokens:
+        if tok == primary_alpha:
+            continue
+        if tok in numeric_tokens:
+            continue
+        if any(ch.isalpha() for ch in tok) and tok in t:
+            other_alpha_hits += 1
+
+    weighted_hits = primary_hit * 10 + numeric_hits * 6 + other_alpha_hits * 3
+    weighted_hits += _version_proximity_bonus(numeric_tokens, candidate_numeric_tokens)
+
+    # Strongly de-prioritize candidates that miss the explicitly specified variant.
+    variant_penalty = 0
+    if specified_variants and variant_hits == 0:
+        variant_penalty = 25
+
+    # Strongly de-prioritize candidates missing the primary token (keep them possible, but rarely top-N).
+    primary_penalty = 0
+    if primary_alpha and primary_hit == 0:
+        primary_penalty = 60
+
+    # De-prioritize candidates missing all numeric version tokens if query had any.
+    version_penalty = 0
+    if numeric_tokens and numeric_hits == 0:
+        version_penalty = 20
+
+    # Add a small bonus based on token hits to improve ordering among fuzzy matches.
+    token_hits = sum(1 for tok in tokens if tok in t) if tokens else 0
+
     if not advanced_fuzzy:
-        return (4, fuzz.WRatio(t, q))
+        score = fuzz.WRatio(t, q)
+        score = int(score) + token_hits * 3 + weighted_hits
+        score = max(0, score - primary_penalty - version_penalty - variant_penalty)
+        score = min(100, score)
+        return (4, score)
 
     if field == "model_id":
-        return (4, fuzz.QRatio(t, q))
+        score = fuzz.QRatio(t, q)
+        score = int(score) + token_hits * 3 + weighted_hits
+        score = max(0, score - primary_penalty - version_penalty - variant_penalty)
+        score = min(100, score)
+        return (4, score)
     if field == "model_name":
-        return (4, fuzz.token_set_ratio(t, q))
-    return (4, fuzz.WRatio(t, q))
+        score = fuzz.token_set_ratio(t, q)
+        score = int(score) + token_hits * 3 + weighted_hits
+        score = max(0, score - primary_penalty - version_penalty - variant_penalty)
+        score = min(100, score)
+        return (4, score)
+    score = fuzz.WRatio(t, q)
+    score = int(score) + token_hits * 3 + weighted_hits
+    score = max(0, score - primary_penalty - version_penalty - variant_penalty)
+    score = min(100, score)
+    return (4, score)
 
 
 def _row_best_rank(query: str, row: Any, fields: List[str], advanced_fuzzy: bool) -> Tuple[int, int]:
@@ -471,7 +695,7 @@ def _root(
         None,
         "--filter",
         "-f",
-        help="Filter conditions.",
+        help="Filter conditions (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
     ),
     limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
@@ -481,13 +705,13 @@ def _root(
         "-s",
         help='Sort by column (e.g., "context_window:desc").',
     ),
-    provider: Optional[str] = typer.Option(
+    provider: Optional[List[str]] = typer.Option(
         None,
         "--provider",
         "-p",
-        help="List models for a provider (exact match by default).",
+        help="List models for provider(s) (repeat -p for multiple; exact match by default).",
     ),
-    provider_partial: bool = typer.Option(False, "--provider-partial", help="Use partial provider match (provider~=...)."),
+    provider_partial: bool = typer.Option(False, "--provider-partial", "-pp", help="Use partial provider match (provider~=...)."),
     tui: bool = typer.Option(False, "--tui", help="Launch the interactive TUI (Textual)."),
     advanced_fuzzy: bool = typer.Option(False, "--advanced-fuzzy/--no-advanced-fuzzy", help="Use advanced fuzzy scoring for search (field-specific)."),
     style: str = typer.Option(
@@ -530,9 +754,11 @@ def _validate_columns(values: Optional[List[str]]) -> Optional[List[str]]:
     invalid: List[str] = []
 
     for v in values:
-        key = v.lower()
-        if key in normalized:
-            resolved.append(normalized[key])
+        raw = (v or "").strip()
+        key = raw.lower()
+        resolved_col = resolve_column_alias(key, available)
+        if resolved_col and resolved_col.lower() in normalized:
+            resolved.append(normalized[resolved_col.lower()])
         else:
             invalid.append(v)
 
@@ -541,6 +767,62 @@ def _validate_columns(values: Optional[List[str]]) -> Optional[List[str]]:
             f"Unknown column(s): {', '.join(invalid)}. Available columns: {', '.join(available)}"
         )
     return resolved
+
+
+def _parse_provider_values(values: Optional[List[str]]) -> List[str]:
+    """Parse repeatable / comma-separated provider options.
+
+    Examples:
+    - ['openrouter', 'google'] -> ['openrouter', 'google']
+    - ['openrouter,google'] -> ['openrouter', 'google']
+    - ['openrouter, google', 'anthropic'] -> ['openrouter', 'google', 'anthropic']
+    """
+    if not values:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            p = part.strip()
+            if not p:
+                continue
+            key = p.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def _filter_df_by_providers(df: fd.DataFrame, providers: List[str], partial: bool) -> fd.DataFrame:
+    if not providers:
+        return df
+    s = df["provider"].astype(str)
+    if partial:
+        import re
+
+        pattern = "|".join(re.escape(p) for p in providers)
+        return df[s.str.contains(pattern, case=False, na=False, regex=True)]
+
+    lowered = {p.lower() for p in providers}
+    return df[s.str.lower().isin(lowered)]
+
+
+def _filter_pdf_by_providers(pdf: pd.DataFrame, providers: List[str], partial: bool) -> pd.DataFrame:
+    if not providers:
+        return pdf
+    s = pdf["provider"].astype(str)
+    if partial:
+        import re
+
+        pattern = "|".join(re.escape(p) for p in providers)
+        return pdf[s.str.contains(pattern, case=False, na=False, regex=True)]
+
+    lowered = {p.lower() for p in providers}
+    return pdf[s.str.lower().isin(lowered)]
 def _load_df() -> fd.DataFrame:
     fetcher = ModelDataFetcher()
     fetcher.fetch_data()
@@ -567,94 +849,89 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
 
     import re
 
+    def _parse_filter(expr: str) -> Optional[Tuple[str, str, str]]:
+        """Parse filter expression allowing spaces around operators.
+
+        Supported operators:
+        - ~= (case-insensitive substring match)
+        - ~  (regex match)
+        - == (alias of =)
+        - =  (exact match)
+        - !=
+        - >=, <=, >, <
+        """
+        s = (expr or "").strip()
+        if not s:
+            return None
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(~=|==|!=|>=|<=|=|~|>|<)\s*(.*?)\s*$", s)
+        if not m:
+            return None
+        col, op, val = m.group(1), m.group(2), m.group(3)
+        if op == "==":
+            op = "="
+        return col, op, val
+
     for f in filters:
-        # Check for different filter types
-        if '~=' in f:  # Partial match
-            col, val = f.split('~=', 1)
-            col = col.strip()
-            # Resolve column alias
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns:
-                df = df[df[resolved_col].astype(str).str.contains(re.escape(val), case=False, na=False)]
-            else:
-                typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
-        elif '~' in f and not f.startswith('~'):  # Regex match
-            col, pattern = f.split('~', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns:
-                try:
-                    df = df[df[resolved_col].astype(str).str.contains(pattern, case=False, na=False, regex=True)]
-                except re.error as e:
-                    typer.echo(f"Error in regex pattern '{pattern}': {e}", err=True)
-            else:
-                typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
-        elif '>=' in f:
-            col, val = f.split('>=', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns and df[resolved_col].dtype in ('int64', 'float64'):
-                try:
-                    val_f = float(val)
-                    df = df[df[resolved_col] >= val_f]
-                except (ValueError, TypeError):
-                    typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
-        elif '<=' in f:
-            col, val = f.split('<=', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns and df[resolved_col].dtype in ('int64', 'float64'):
-                try:
-                    val_f = float(val)
-                    df = df[df[resolved_col] <= val_f]
-                except (ValueError, TypeError):
-                    typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
-        elif '!=' in f:
-            col, val = f.split('!=', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns:
-                df = df[df[resolved_col].astype(str) != str(val)]
-            else:
-                typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
-        elif '=' in f:  # Exact match
-            col, val = f.split('=', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns:
-                # Try to convert value to the same type as the column
-                try:
-                    if df[resolved_col].dtype == 'int64':
-                        val = int(val)
-                    elif df[resolved_col].dtype == 'float64':
-                        val = float(val)
-                    elif df[resolved_col].dtype == 'bool':
-                        val = str(val).lower() in ('true', '1', 'yes')
-                except (ValueError, TypeError):
-                    pass
-                df = df[df[resolved_col] == val]
-            else:
-                typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
-        elif '>' in f:  # Greater than
-            col, val = f.split('>', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns and df[resolved_col].dtype in ('int64', 'float64'):
-                try:
-                    val_f = float(val)
-                    df = df[df[resolved_col] > val_f]
-                except (ValueError, TypeError):
-                    typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
-        elif '<' in f:
-            col, val = f.split('<', 1)
-            col = col.strip()
-            resolved_col = resolve_column_alias(col, df.columns.tolist())
-            if resolved_col in df.columns and df[resolved_col].dtype in ('int64', 'float64'):
-                try:
-                    val_f = float(val)
-                    df = df[df[resolved_col] < val_f]
-                except (ValueError, TypeError):
-                    typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
+        parsed = _parse_filter(f)
+        if not parsed:
+            typer.echo(f"Warning: Could not parse filter '{f}'. Expected: column<op>value", err=True)
+            continue
+
+        col, op, val = parsed
+        resolved_col = resolve_column_alias(col, df.columns.tolist())
+        if resolved_col not in df.columns:
+            typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
+            continue
+
+        # Partial match
+        if op == "~=":
+            df = df[df[resolved_col].astype(str).str.contains(re.escape(val), case=False, na=False)]
+            continue
+
+        # Regex match
+        if op == "~":
+            try:
+                df = df[df[resolved_col].astype(str).str.contains(val, case=False, na=False, regex=True)]
+            except re.error as e:
+                typer.echo(f"Error in regex pattern '{val}': {e}", err=True)
+            continue
+
+        # Typed conversions (best-effort)
+        typed_val: Any = val
+        try:
+            if df[resolved_col].dtype == "int64":
+                typed_val = int(str(val).strip())
+            elif df[resolved_col].dtype == "float64":
+                typed_val = float(str(val).strip())
+            elif df[resolved_col].dtype == "bool":
+                typed_val = str(val).strip().lower() in ("true", "1", "yes", "y", "on")
+        except Exception:
+            typed_val = val
+
+        if op == "=":
+            df = df[df[resolved_col] == typed_val]
+        elif op == "!=":
+            df = df[df[resolved_col] != typed_val]
+        elif op == ">=":
+            try:
+                df = df[df[resolved_col] >= float(typed_val)]
+            except Exception:
+                typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
+        elif op == "<=":
+            try:
+                df = df[df[resolved_col] <= float(typed_val)]
+            except Exception:
+                typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
+        elif op == ">":
+            try:
+                df = df[df[resolved_col] > float(typed_val)]
+            except Exception:
+                typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
+        elif op == "<":
+            try:
+                df = df[df[resolved_col] < float(typed_val)]
+            except Exception:
+                typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
 
     return df
 
@@ -697,12 +974,13 @@ def _apply_sort(df: fd.DataFrame, sort: Optional[str]) -> fd.DataFrame:
     if not sort:
         return df
 
-    sort_column = sort
+    sort_column = sort.strip()
     ascending = True
 
     if ':' in sort:
         sort_column, direction = sort.split(':', 1)
-        ascending = direction.lower() != 'desc'
+        sort_column = sort_column.strip()
+        ascending = direction.strip().lower() != 'desc'
 
     sort_column = resolve_column_alias(sort_column, df.columns.tolist())
 
@@ -716,7 +994,13 @@ def _apply_sort(df: fd.DataFrame, sort: Optional[str]) -> fd.DataFrame:
     return df
 
 
-def _render_table(df: fd.DataFrame, columns: List[str], limit: int, title_prefix: str = "Model Data"):
+def _render_table(
+    df: fd.DataFrame,
+    columns: List[str],
+    limit: int,
+    title_prefix: str = "Model Data",
+    style: Optional[str] = None,
+):
     display_df = df[columns].head(limit).copy()
 
     for col in display_df.columns:
@@ -730,7 +1014,7 @@ def _render_table(df: fd.DataFrame, columns: List[str], limit: int, title_prefix
         display_data,
         columns,
         f"{title_prefix} (showing {len(display_data)} of {len(df)} models)",
-        style=getattr(df, "_rich_table_style", None),
+        style=style or getattr(df, "_rich_table_style", None),
     )
 
 
@@ -755,16 +1039,14 @@ def _list_models(
 
     # Provider shortcut
     if provider:
-        if provider_partial:
-            filters = list(filters or []) + [f"provider~={provider}"]
-        else:
-            filters = list(filters or []) + [f"provider={provider}"]
+        providers = _parse_provider_values(provider)
+        df = _filter_df_by_providers(df, providers, partial=provider_partial)
 
     df = _apply_filters(df, filters)
     df = _apply_sort(df, sort)
 
     columns = _select_columns(df, column, all_columns)
-    _render_table(df, columns, limit)
+    _render_table(df, columns, limit, style=style)
 
 
 class ModelDetailScreen(ModalScreen):
@@ -1891,11 +2173,27 @@ def providers(
 def search(
     query: str = typer.Argument(..., help="Search query for model_id/model_name."),
     in_: str = typer.Option("both", "--in", help="Search field: id|name|both."),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Restrict to a provider (exact match)."),
+    provider: Optional[List[str]] = typer.Option(
+        None,
+        "--provider",
+        "-p",
+        help="Restrict to provider(s) (repeat -p for multiple; exact match).",
+    ),
+    provider_partial: bool = typer.Option(
+        False,
+        "--provider-partial",
+        "-pp",
+        help="Use partial provider match (case-insensitive substring).",
+    ),
     limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
     column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
-    filters: Optional[List[str]] = typer.Option(None, "--filter", "-f", help="Additional filters to apply."),
+    filters: Optional[List[str]] = typer.Option(
+        None,
+        "--filter",
+        "-f",
+        help="Additional filters (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
+    ),
     advanced_fuzzy: bool = typer.Option(False, "--advanced-fuzzy/--no-advanced-fuzzy", help="Use advanced fuzzy scoring for search (field-specific)."),
     style: str = typer.Option(
         "simple",
@@ -1907,7 +2205,8 @@ def search(
     """Fuzzy search models by model_id/model_name (sorted by fuzzy score desc)."""
     pdf = _load_pdf()
     if provider:
-        pdf = pdf[pdf['provider'].astype(str) == str(provider)]
+        providers = _parse_provider_values(provider)
+        pdf = _filter_pdf_by_providers(pdf, providers, partial=provider_partial)
 
     # Apply extra filters using the same filter syntax by temporarily converting to fd.DataFrame
     if filters:
@@ -1951,12 +2250,22 @@ def search(
 @app.command("list")
 def list_cmd(
     column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
-    filters: Optional[List[str]] = typer.Option(None, "--filter", "-f", help="Filter conditions."),
+    filters: Optional[List[str]] = typer.Option(
+        None,
+        "--filter",
+        "-f",
+        help="Filter conditions (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
+    ),
     limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
     sort: Optional[str] = typer.Option(None, "--sort", "-s", help='Sort by column (e.g., "context_window:desc").'),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="List models for a provider (exact match by default)."),
-    provider_partial: bool = typer.Option(False, "--provider-partial", help="Use partial provider match (provider~=...)."),
+    provider: Optional[List[str]] = typer.Option(
+        None,
+        "--provider",
+        "-p",
+        help="List models for provider(s) (repeat -p for multiple; exact match by default).",
+    ),
+    provider_partial: bool = typer.Option(False, "--provider-partial", "-pp", help="Use partial provider match (provider~=...)."),
     style: str = typer.Option(
         "simple",
         "--style",
@@ -1982,7 +2291,12 @@ def provider_cmd(
     provider: str = typer.Argument(..., help="Provider name."),
     partial: bool = typer.Option(True, "--partial/--exact", help="Use partial match by default."),
     column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
-    filters: Optional[List[str]] = typer.Option(None, "--filter", "-f", help="Additional filters."),
+    filters: Optional[List[str]] = typer.Option(
+        None,
+        "--filter",
+        "-f",
+        help="Additional filters (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
+    ),
     limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
     sort: Optional[str] = typer.Option(None, "--sort", "-s", help='Sort by column (e.g., "context_window:desc").'),
@@ -2000,7 +2314,7 @@ def provider_cmd(
         limit=limit,
         all_columns=all_columns,
         sort=sort,
-        provider=provider,
+        provider=[provider],
         provider_partial=partial,
         style=style,
     )

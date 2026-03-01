@@ -19,17 +19,25 @@
 
 - Common options (list/provider):
   - `--column/-c` (repeatable)
-  - `--filter/-f` (repeatable; supports `=`, `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`)
+  - `--filter/-f` (repeatable; supports `=`, `==`, `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`; operator whitespace is allowed)
   - `--limit/-l`
   - `--all-columns`
   - `--sort/-s` (supports `:asc`/`:desc`)
+  - Column aliases are supported in `--column`, `--sort`, and `--filter` (e.g. `id`, `name`, `input`, `output`, `context`, `tokens`, `max_tokens`).
   - `--version`
+
+- Provider selection:
+  - `-p/--provider` is repeatable and also supports comma-separated lists (e.g. `-p openrouter -p google` or `-p openrouter,google`).
+  - Exact matching is the default; `--provider-partial/-pp` enables case-insensitive substring matching.
 
 ## Data flow
 
 - `ModelDataFetcher` fetches JSON from `https://models.dev/api.json`.
+ - `ModelDataFetcher.fetch_data()` caches the fetched JSON on disk (default: `~/.cache/models/api.json`) with a configurable TTL (default: 24 hours). If the remote fetch fails, it falls back to the cached file when available.
+   - Env: `MODELS_CACHE_PATH`, `MODELS_CACHE_TTL_SECONDS`
 - Data is flattened into records and converted into a DataFrame for filtering/sorting.
 - Results are rendered using `rich.Table`.
+ - The selected Rich table style (`--style`) is threaded into rendering explicitly so it remains consistent even if filtering/sorting creates a new DataFrame.
  - Fuzzy search uses `rapidfuzz.fuzz.WRatio` over `model_id` and/or `model_name`.
  - TUI uses Textual widgets (`DataTable`, `Select`, `Input`) and refreshes the view on input changes.
  - TUI details view is shown via a `ModalScreen` when Enter is pressed in the search input (top result) or on the table (cursor row).

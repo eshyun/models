@@ -16,4 +16,11 @@
 - Improved TUI detail modal content structure while keeping raw JSON.
 - Upgraded TUI layout with a split-view preview panel (`p`), a command palette for slash commands, and a 2-column detail view (summary + raw JSON).
 - Added `--style` option to Rich table outputs to select box styles (simple, rounded, minimal, square, ascii).
+- Fixed `models list --style` so the selected table style is applied consistently.
+- Improved CLI `--filter` parsing to allow spaces around operators and added `==` as an alias of `=`.
+- Added common column aliases for CLI options (`--column`, `--sort`, `--filter`), e.g. `id`, `name`, `input`, `output`, `context`, `tokens`.
 - Added `--advanced-fuzzy` option for field-specific fuzzy scoring and TUI toggle via `/af on|off`.
+- Improved provider filtering across CLI commands: repeatable `-p/--provider`, comma-separated provider lists, and shared exact/partial filtering logic.
+- Added `--provider-partial/-pp` to `models search` for case-insensitive substring provider matching.
+- Added `--style` to `models providers` when using `--format table`.
+- Added a 24h local cache for remote `api.json` fetches with configurable TTL/path and stale-cache fallback on network errors.

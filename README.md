@@ -22,6 +22,19 @@ A command-line tool for fetching and displaying AI model information from the mo
 
 ## Usage
 
+### Data caching
+
+The tool fetches model data from `https://models.dev/api.json` and caches it locally to avoid repeated network requests.
+
+- Default TTL: 24 hours
+- Cache path: `~/.cache/models/api.json` (configurable)
+- On network failure, the tool will fall back to the cached data if available.
+
+Environment variables:
+
+- `MODELS_CACHE_PATH`: Override the cache file path.
+- `MODELS_CACHE_TTL_SECONDS`: Override TTL in seconds (set to `0` to disable TTL and always fetch remotely).
+
 ### Running the tool
 
 After installation, you can run the tool using:
@@ -64,6 +77,18 @@ Filter results:
 models -f "provider=openai"
 ```
 
+Filter syntax notes:
+
+- Operators support optional spaces (e.g. `provider ~= openrou`).
+- Supported operators: `=`, `==` (alias of `=`), `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`.
+- Common column aliases can be used in `--column`, `--sort`, and `--filter`:
+  - `id` -> `model_id`
+  - `name` -> `model_name`
+  - `input` -> `input_cost`
+  - `output` -> `output_cost`
+  - `context` -> `context_window`
+  - `tokens` / `max_tokens` -> `max_output_tokens`
+
 Show all available columns:
 ```bash
 models --all-columns
@@ -72,6 +97,13 @@ models --all-columns
 Use a different table style:
 ```bash
 models --style rounded
+```
+
+Alias examples:
+```bash
+models -c id -c provider -c input -c output
+models --sort context:desc
+models -f "id ~= gpt" -f "context >= 100000"
 ```
 
 List providers (default: table with counts):
@@ -103,6 +135,9 @@ List models for a provider:
 ```bash
 models provider openai
 models list --provider openai --provider-partial
+models search -p openrouter -p google gemini -l 10
+models search -p openrouter,google gemini -l 10
+models search -p open --provider-partial gemini -l 10
 ```
 
 Launch TUI:

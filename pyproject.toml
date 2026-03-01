@@ -24,3 +24,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["models", "models.*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
