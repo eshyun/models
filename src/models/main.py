@@ -22,7 +22,86 @@ from textual.widgets import DataTable, Input, Select, Footer, Header, Static, Bu
 from ._version import __version__
 
 
-STYLE_CHOICES = ["simple", "rounded", "minimal", "square", "ascii"]
+STYLE_CHOICES = ["simple", "rounded", "minimal", "square", "ascii", "plain"]
+
+
+def _safe_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _flatten_json(prefix: str, obj: Any, out: Dict[str, Any], sep: str = "__") -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = str(k)
+            next_prefix = f"{prefix}{sep}{key}" if prefix else key
+            _flatten_json(next_prefix, v, out, sep=sep)
+        return
+    if isinstance(obj, list):
+        out[prefix] = _safe_json_dumps(obj)
+        return
+    out[prefix] = obj
+
+
+def _iter_raw_models(raw_data: Dict[str, Any]):
+    for provider, provider_data in (raw_data or {}).items():
+        if not isinstance(provider_data, dict):
+            continue
+        models = provider_data.get("models", {})
+        if not isinstance(models, dict):
+            continue
+        for model_id, model_data in models.items():
+            yield provider, model_id, model_data
+
+
+def _find_raw_model_records(
+    raw_data: Dict[str, Any],
+    model_id: str,
+    provider: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not model_id:
+        return []
+
+    wanted_id = str(model_id)
+    wanted_provider = (str(provider).strip() if provider else "").strip()
+    matches: List[Dict[str, Any]] = []
+    for prov, mid, mdata in _iter_raw_models(raw_data):
+        if mid != wanted_id:
+            continue
+        if wanted_provider and str(prov) != wanted_provider:
+            continue
+        matches.append({"provider": prov, "model_id": mid, "model": mdata})
+    return matches
+
+
+def _format_kv_lines(data: Any) -> str:
+    if isinstance(data, dict):
+        lines: List[str] = []
+        for k in sorted(data.keys(), key=lambda x: str(x)):
+            v = data.get(k)
+            if isinstance(v, (dict, list)):
+                rendered = json.dumps(v, ensure_ascii=False, default=str)
+            else:
+                rendered = str(v)
+            lines.append(f"{k}: {rendered}")
+        return "\n".join(lines)
+    return str(data)
+
+
+def _render_kv_table(title: str, data: Dict[str, Any]) -> None:
+    table = Table(title=title)
+    table.add_column("key")
+    table.add_column("value")
+    for k in sorted(data.keys(), key=lambda x: str(x)):
+        v = data.get(k)
+        if isinstance(v, (dict, list)):
+            rendered = json.dumps(v, ensure_ascii=False, default=str)
+        else:
+            rendered = "" if v is None else str(v)
+        table.add_row(str(k), rendered)
+    Console().print(table)
 
 class ModelDataFetcher:
     """Fetches and processes AI model data from the models.dev API."""
@@ -125,17 +204,16 @@ class ModelDataFetcher:
         Returns:
             A flattened dictionary with model information. Missing cost data will be set to None.
         """
-        # Initialize default values
-        result = {
+        result: Dict[str, Any] = {
             'model_id': model_id,
             'model_name': '',
             'provider': provider,
             'supports_attachments': False,
             'supports_reasoning': False,
             'supports_temperature': False,
-            'input_cost': None,  # Use None for missing values
-            'output_cost': None,  # Use None for missing values
-            'cost_cache_read_per_million': None,  # Use None for missing values
+            'input_cost': None,
+            'output_cost': None,
+            'cost_cache_read_per_million': None,
             'context_window': 0,
             'max_output_tokens': 0,
         }
@@ -192,43 +270,62 @@ class ModelDataFetcher:
             except (ValueError, TypeError):
                 # Keep the values as None if conversion fails
                 pass
-        
+
         # Get limits
         if 'limit' in model_data and isinstance(model_data['limit'], dict):
             limits = model_data['limit']
-            result['context_window'] = int(limits.get('context', 0))
-            result['max_output_tokens'] = int(limits.get('output', 0))
-        
+            try:
+                result['context_window'] = int(limits.get('context', 0) or 0)
+            except Exception:
+                pass
+            try:
+                result['max_output_tokens'] = int(limits.get('output', 0) or 0)
+            except Exception:
+                pass
+
+        # Flatten raw fields into extra columns (best-effort)
+        try:
+            extra: Dict[str, Any] = {}
+            _flatten_json("", model_data, extra, sep="__")
+            for k, v in extra.items():
+                if k in result:
+                    continue
+                if isinstance(v, (dict, list)):
+                    result[k] = _safe_json_dumps(v)
+                else:
+                    result[k] = v
+        except Exception:
+            pass
 
         return result
-    
+
     def to_dataframe(self) -> fd.DataFrame:
         """
         Converts the fetched model data to a FireDucks DataFrame.
-        
+
         Returns:
             FireDucks DataFrame containing the model data.
-            
+
         Raises:
             ValueError: If no data has been fetched yet.
         """
         if self._raw_data is None:
             raise ValueError("No data available. Call fetch_data() first.")
-        
+
         records = []
-        
+
         # Process models from each provider
         for provider, provider_data in self._raw_data.items():
             models = provider_data.get('models', {})
             for model_id, model_data in models.items():
                 record = self._flatten_model_data(provider, model_id, model_data)
                 records.append(record)
-        
+
         # Create a pandas DataFrame first, then convert to FireDucks
         pdf = pd.DataFrame(records)
-        
+
         self._df = fd.DataFrame(pdf)
-        
+
         return self._df
     
     def get_models_by_provider(self, provider: str) -> fd.DataFrame:
@@ -284,6 +381,54 @@ def get_available_columns() -> List[str]:
         'context_window', 'max_output_tokens'
     ]
 
+
+def get_default_display_columns() -> List[str]:
+    return [
+        'provider',
+        'model_id',
+        'input_cost',
+        'output_cost',
+        'context_window',
+        'max_output_tokens',
+        'model_name',
+    ]
+
+
+def _normalize_column_alias_key(raw: str) -> str:
+    """Normalize a user-provided column key into a stable alias token.
+
+    This is intentionally conservative (no fuzzy matching): it only supports
+    common prefix/suffix variants like *_at.
+    """
+    key = (raw or "").strip().lower()
+    if not key:
+        return key
+
+    variants_to_updated = {
+        "updated",
+        "updated_at",
+        "last_updated",
+        "last_updated_at",
+        "lastupdate",
+        "lastupdate_at",
+        "last_update",
+        "last_update_at",
+    }
+    if key in variants_to_updated:
+        return "updated"
+
+    variants_to_release = {
+        "release",
+        "release_at",
+        "release_date",
+        "released",
+        "released_at",
+    }
+    if key in variants_to_release:
+        return "release"
+
+    return key
+
 def resolve_column_alias(column: str, available_columns: List[str]) -> str:
     """Resolve column aliases to their actual column names.
     
@@ -294,11 +439,15 @@ def resolve_column_alias(column: str, available_columns: List[str]) -> str:
     Returns:
         The resolved column name if found, otherwise the original column name
     """
-    key = (column or "").strip().lower()
+    key = _normalize_column_alias_key(column)
     # Define aliases mapping
     aliases = {
         "id": "model_id",
         "name": "model_name",
+        "updated": "last_updated",
+        "lastupdate": "last_updated",
+        "last_update": "last_updated",
+        "release": "release_date",
         "input": "input_cost",
         "output": "output_cost",
         "context": "context_window",
@@ -319,6 +468,49 @@ def resolve_column_alias(column: str, available_columns: List[str]) -> str:
         return normalized[key]
 
     return (column or "").strip()
+
+
+def resolve_column_spec(column: str, available_columns: List[str]) -> List[str]:
+    key = _normalize_column_alias_key(column)
+    specs: Dict[str, List[str]] = {
+        "id": ["model_id"],
+        "name": ["model_name"],
+        "updated": ["last_updated"],
+        "lastupdate": ["last_updated"],
+        "last_update": ["last_updated"],
+        "release": ["release_date"],
+        "model": ["model_id", "model_name"],
+        "supports": ["supports_attachments", "supports_reasoning", "supports_temperature"],
+        "cost": ["input_cost", "output_cost"],
+        "tokens": ["max_output_tokens"],
+        "context": ["context_window"],
+        "input": ["input_cost"],
+        "output": ["output_cost"],
+        "max_tokens": ["max_output_tokens"],
+        "cost_input_per_million": ["input_cost"],
+        "cost_output_per_million": ["output_cost"],
+        "cost_cache_read": ["cost_cache_read_per_million"],
+    }
+
+    normalized = {c.lower(): c for c in available_columns}
+    if key in specs:
+        out: List[str] = []
+        seen: set[str] = set()
+        for spec_col in specs[key]:
+            resolved = resolve_column_alias(spec_col, available_columns)
+            resolved = normalized.get(resolved.lower(), resolved)
+            if resolved.lower() in normalized and resolved.lower() not in seen:
+                seen.add(resolved.lower())
+                out.append(resolved)
+            elif resolved and resolved.lower() not in seen and resolved in available_columns:
+                seen.add(resolved.lower())
+                out.append(resolved)
+        if out:
+            return out
+
+    resolved_single = resolve_column_alias(column, available_columns)
+    resolved_single = normalized.get(resolved_single.lower(), resolved_single)
+    return [resolved_single] if resolved_single else []
 
 def format_context_window(value: int) -> str:
     """Format context window value to human-readable format (K or M)."""
@@ -386,6 +578,8 @@ def resolve_rich_table_box(style: Optional[str]) -> Optional[box.Box]:
     if not style:
         return None
     key = style.strip().lower()
+    if key == "plain":
+        return None
     mapping = {
         "simple": box.SIMPLE,
         "rounded": box.ROUNDED,
@@ -395,9 +589,13 @@ def resolve_rich_table_box(style: Optional[str]) -> Optional[box.Box]:
     }
     if key not in mapping:
         raise typer.BadParameter(
-            f"Unknown --style '{style}'. Supported: {', '.join(sorted(mapping.keys()))}"
+            f"Unknown --style '{style}'. Supported: {', '.join(sorted([*mapping.keys(), 'plain']))}"
         )
     return mapping[key]
+
+
+def _is_plain_table_style(style: Optional[str]) -> bool:
+    return bool(style) and style.strip().lower() == "plain"
 
 
 def _normalize_query(s: str) -> str:
@@ -641,7 +839,9 @@ def display_results(data: List[Dict], columns: List[str], title: str = "Model Da
 
     console = Console()
     resolved_box = resolve_rich_table_box(style)
-    if resolved_box is not None:
+    if _is_plain_table_style(style):
+        table = Table(title=title, show_header=True, header_style="bold magenta", box=None, show_edge=False)
+    elif resolved_box is not None:
         table = Table(title=title, show_header=True, header_style="bold magenta", box=resolved_box)
     else:
         table = Table(title=title, show_header=True, header_style="bold magenta")
@@ -691,13 +891,19 @@ def _root(
         "-c",
         help="Column(s) to display. Can be specified multiple times.",
     ),
+    add_column: Optional[List[str]] = typer.Option(
+        None,
+        "--add-column",
+        "-C",
+        help="Additional column(s) to add to the default output. Can be specified multiple times.",
+    ),
     filters: Optional[List[str]] = typer.Option(
         None,
         "--filter",
         "-f",
         help="Filter conditions (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
     ),
-    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
+    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display (0 = no limit)."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
     sort: Optional[str] = typer.Option(
         None,
@@ -718,7 +924,7 @@ def _root(
         "simple",
         "--style",
         click_type=click.Choice(STYLE_CHOICES, case_sensitive=False),
-        help="Rich table style: simple, rounded, minimal, square, ascii.",
+        help="Rich table style: simple, rounded, minimal, square, ascii, plain.",
     ),
     version: Optional[bool] = typer.Option(
         None,
@@ -735,6 +941,7 @@ def _root(
         return
     _list_models(
         column=column,
+        add_column=add_column,
         filters=filters,
         limit=limit,
         all_columns=all_columns,
@@ -745,10 +952,9 @@ def _root(
     )
 
 
-def _validate_columns(values: Optional[List[str]]) -> Optional[List[str]]:
+def _validate_columns(values: Optional[List[str]], available: List[str]) -> Optional[List[str]]:
     if not values:
         return values
-    available = get_available_columns()
     normalized = {c.lower(): c for c in available}
     resolved: List[str] = []
     invalid: List[str] = []
@@ -756,11 +962,11 @@ def _validate_columns(values: Optional[List[str]]) -> Optional[List[str]]:
     for v in values:
         raw = (v or "").strip()
         key = raw.lower()
-        resolved_col = resolve_column_alias(key, available)
-        if resolved_col and resolved_col.lower() in normalized:
-            resolved.append(normalized[resolved_col.lower()])
-        else:
-            invalid.append(v)
+        for resolved_col in resolve_column_spec(key, available):
+            if resolved_col and resolved_col.lower() in normalized:
+                resolved.append(normalized[resolved_col.lower()])
+            else:
+                invalid.append(v)
 
     if invalid:
         raise typer.BadParameter(
@@ -794,6 +1000,34 @@ def _parse_provider_values(values: Optional[List[str]]) -> List[str]:
                 continue
             seen.add(key)
             out.append(p)
+    return out
+
+
+def _parse_column_values(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Parse repeatable / comma-separated column options.
+
+    Examples:
+    - ['provider', 'model_id'] -> ['provider', 'model_id']
+    - ['provider,model_id'] -> ['provider', 'model_id']
+    - ['provider, model_id', 'provider'] -> ['provider', 'model_id']
+    """
+    if not values:
+        return values
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            c = part.strip()
+            if not c:
+                continue
+            key = c.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
     return out
 
 
@@ -863,6 +1097,11 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
         s = (expr or "").strip()
         if not s:
             return None
+        m_short = re.match(r"^(!)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", s)
+        if m_short:
+            neg = bool(m_short.group(1))
+            col_only = m_short.group(2)
+            return col_only, "=", "false" if neg else "true"
         m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(~=|==|!=|>=|<=|=|~|>|<)\s*(.*?)\s*$", s)
         if not m:
             return None
@@ -936,22 +1175,67 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
     return df
 
 
-def _select_columns(df: fd.DataFrame, column: Optional[List[str]], all_columns: bool) -> List[str]:
+def _select_columns(
+    df: fd.DataFrame,
+    column: Optional[List[str]],
+    add_column: Optional[List[str]],
+    all_columns: bool,
+) -> List[str]:
+    base_columns: List[str]
     if all_columns:
-        columns = get_available_columns()
+        all_cols = df.columns.tolist()
+        # Keep top-level columns for readability; nested flattened columns remain available
+        # for --sort/--filter/--column but are hidden from the default --all-columns output.
+        base_columns = [c for c in all_cols if "__" not in str(c)]
+        hidden = [c for c in all_cols if "__" in str(c)]
+        if hidden:
+            preview = ", ".join(hidden[:12])
+            suffix = "" if len(hidden) <= 12 else f" (+{len(hidden) - 12} more)"
+            typer.echo(
+                "Note: --all-columns hides nested flattened columns (those containing '__') for readability. "
+                f"Hidden: {len(hidden)} ({preview}{suffix}). Use --column/--add-column to display them explicitly.",
+                err=True,
+            )
     elif column:
-        column = _validate_columns(column)
-        columns = [resolve_column_alias(col, get_available_columns()) for col in column]
+        parsed = _parse_column_values(column)
+        expanded: List[str] = []
+        seen: set[str] = set()
+        for raw in parsed or []:
+            for c in resolve_column_spec(raw, df.columns.tolist()):
+                key = c.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                expanded.append(c)
+        base_columns = _validate_columns(expanded, df.columns.tolist())
     else:
-        columns = [
-            'provider',
-            'model_id',
-            'input_cost',
-            'output_cost',
-            'context_window',
-            'max_output_tokens',
-            'model_name',
-        ]
+        base_columns = get_default_display_columns()
+
+    # Additive columns: extend base output, preserving order and dedup.
+    if add_column:
+        parsed_add = _parse_column_values(add_column)
+        expanded_add: List[str] = []
+        seen_add: set[str] = set()
+        for raw in parsed_add or []:
+            for c in resolve_column_spec(raw, df.columns.tolist()):
+                key = c.lower()
+                if key in seen_add:
+                    continue
+                seen_add.add(key)
+                expanded_add.append(c)
+        expanded_add = _validate_columns(expanded_add, df.columns.tolist())
+
+        merged: List[str] = []
+        seen_merged: set[str] = set()
+        for c in (base_columns or []) + (expanded_add or []):
+            key = str(c).lower()
+            if key in seen_merged:
+                continue
+            seen_merged.add(key)
+            merged.append(c)
+        columns = merged
+    else:
+        columns = list(base_columns or [])
 
     available_cols = set(df.columns)
     valid_columns = [col for col in columns if col in available_cols]
@@ -982,7 +1266,11 @@ def _apply_sort(df: fd.DataFrame, sort: Optional[str]) -> fd.DataFrame:
         sort_column = sort_column.strip()
         ascending = direction.strip().lower() != 'desc'
 
-    sort_column = resolve_column_alias(sort_column, df.columns.tolist())
+    available = df.columns.tolist()
+    sort_spec = resolve_column_spec(sort_column, available)
+    if sort_spec:
+        sort_column = sort_spec[0]
+    sort_column = resolve_column_alias(sort_column, available)
 
     if sort_column in df.columns:
         return df.sort_values(by=sort_column, ascending=ascending)
@@ -1001,7 +1289,10 @@ def _render_table(
     title_prefix: str = "Model Data",
     style: Optional[str] = None,
 ):
-    display_df = df[columns].head(limit).copy()
+    if limit is not None and int(limit) > 0:
+        display_df = df[columns].head(int(limit)).copy()
+    else:
+        display_df = df[columns].copy()
 
     for col in display_df.columns:
         if display_df[col].dtype == 'float64':
@@ -1021,6 +1312,7 @@ def _render_table(
 def _list_models(
     *,
     column: Optional[List[str]],
+    add_column: Optional[List[str]],
     filters: Optional[List[str]],
     limit: int,
     all_columns: bool,
@@ -1045,7 +1337,7 @@ def _list_models(
     df = _apply_filters(df, filters)
     df = _apply_sort(df, sort)
 
-    columns = _select_columns(df, column, all_columns)
+    columns = _select_columns(df, column, add_column, all_columns)
     _render_table(df, columns, limit, style=style)
 
 
@@ -1208,6 +1500,338 @@ class ProviderPickerScreen(ModalScreen):
         self.action_apply()
 
 
+class ColumnsPickerScreen(ModalScreen):
+    CSS = """
+    ColumnsPickerScreen {
+        layout: vertical;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #columns_picker {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, available_columns: List[str], selected_columns: List[str]):
+        super().__init__()
+        self._available = list(available_columns or [])
+        self._selected = [c for c in (selected_columns or []) if c in self._available]
+        # Ensure selected columns appear first (stable) when applying.
+
+        self._all_options: List[str] = ["(apply current selection)"] + self._render_options(self._available)
+        self._current_options: List[str] = list(self._all_options)
+
+    def _render_options(self, columns: List[str]) -> List[str]:
+        rendered: List[str] = []
+        selected_set = {c.lower() for c in self._selected}
+        for c in columns:
+            mark = "[x]" if str(c).lower() in selected_set else "[ ]"
+            rendered.append(f"{mark} {c}")
+        return rendered
+
+    def _option_to_column(self, option: str) -> Optional[str]:
+        raw = (option or "").strip()
+        if raw.startswith("[x] ") or raw.startswith("[ ] "):
+            return raw[4:]
+        return None
+
+    def _update_selected_summary(self) -> None:
+        try:
+            widget = self.query_one("#columns_selected_summary", Static)
+        except Exception:
+            return
+        cols = list(self._selected)
+        if not cols:
+            widget.update("Selected: 0")
+            return
+        preview_max = 12
+        preview = ", ".join(cols[:preview_max])
+        suffix = "" if len(cols) <= preview_max else f" (+{len(cols) - preview_max} more)"
+        widget.update(f"Selected: {len(cols)} ({preview}{suffix})")
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"Select columns ({len(self._available)})")
+        yield Static("", id="columns_selected_summary")
+        yield Input(placeholder="Filter columns (substring)", id="columns_filter")
+        yield OptionList(*self._all_options, id="columns_picker")
+        with Horizontal():
+            yield Button("Apply", id="apply")
+            yield Button("Reset", id="reset")
+            yield Button("Cancel", id="cancel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#columns_filter", Input).focus()
+        except Exception:
+            pass
+        try:
+            picker = self.query_one("#columns_picker", OptionList)
+            picker.highlighted = 0
+        except Exception:
+            pass
+        self._update_selected_summary()
+
+    def _set_picker_options(self, columns: List[str]) -> None:
+        self._current_options = ["(apply current selection)"] + self._render_options(columns)
+        picker = self.query_one("#columns_picker", OptionList)
+        if hasattr(picker, "clear_options"):
+            picker.clear_options()
+            picker.add_options(self._current_options)
+        else:
+            try:
+                picker.remove()
+            except Exception:
+                pass
+            try:
+                parent = self.query_one("#columns_filter", Input).parent
+                if parent is not None:
+                    parent.mount(OptionList(*self._current_options, id="columns_picker"))
+            except Exception:
+                pass
+        try:
+            picker.highlighted = 0
+        except Exception:
+            pass
+        self._update_selected_summary()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "columns_filter":
+            return
+        q = (event.value or "").strip().lower()
+        if not q:
+            self._set_picker_options(self._available)
+            return
+        filtered = [c for c in self._available if q in str(c).lower()]
+        if not filtered:
+            self._set_picker_options([])
+            return
+        self._set_picker_options(filtered)
+
+    def _toggle_column(self, col: str) -> None:
+        lowered = {c.lower() for c in self._selected}
+        if col.lower() in lowered:
+            self._selected = [c for c in self._selected if c.lower() != col.lower()]
+        else:
+            self._selected.append(col)
+        # Re-render current view
+        current_cols: List[str] = []
+        for opt in self._current_options[1:]:
+            c = self._option_to_column(opt)
+            if c is not None:
+                current_cols.append(c)
+        self._set_picker_options(current_cols)
+        self._update_selected_summary()
+
+    def action_apply(self) -> None:
+        try:
+            app = self.app
+            cols = list(self._selected)
+            if not cols:
+                # Avoid empty table
+                cols = [
+                    "provider",
+                    "model_id",
+                    "input_cost",
+                    "output_cost",
+                    "context_window",
+                    "max_output_tokens",
+                    "model_name",
+                ]
+            if hasattr(app, "_table_columns"):
+                setattr(app, "_table_columns", cols)
+            if hasattr(app, "_rebuild_table_columns"):
+                app._rebuild_table_columns()
+            if hasattr(app, "_refresh_table"):
+                app._refresh_table()
+        except Exception:
+            pass
+        self.dismiss()
+
+    def action_reset(self) -> None:
+        self._selected = [
+            "provider",
+            "model_id",
+            "input_cost",
+            "output_cost",
+            "context_window",
+            "max_output_tokens",
+            "model_name",
+        ]
+        self._set_picker_options(self._available)
+        self._update_selected_summary()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self.action_apply()
+            return
+        if event.button.id == "reset":
+            self.action_reset()
+            return
+        if event.button.id == "cancel":
+            self.dismiss()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        try:
+            picker = self.query_one("#columns_picker", OptionList)
+            idx = getattr(picker, "highlighted", None)
+            if idx is None:
+                idx = 0
+            idx = int(idx)
+        except Exception:
+            idx = 0
+
+        if idx <= 0:
+            self.action_apply()
+            return
+        if 0 <= idx < len(self._current_options):
+            opt = self._current_options[idx]
+            col = self._option_to_column(opt)
+            if col:
+                self._toggle_column(col)
+
+
+class SortKeyPickerScreen(ModalScreen):
+    CSS = """
+    SortKeyPickerScreen {
+        layout: vertical;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #sort_picker {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, keys: List[str], current_key: Optional[str] = None, desc: bool = True):
+        super().__init__()
+        self._keys = list(keys or [])
+        self._all_options: List[str] = ["(none)"] + [k for k in self._keys]
+        self._current_options: List[str] = list(self._all_options)
+        self._current_key = current_key
+        self._desc = bool(desc)
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"Select sort key ({len(self._keys)})")
+        yield Select([("desc", "desc"), ("asc", "asc")], value=("desc" if self._desc else "asc"), id="sort_order")
+        yield Input(placeholder="Filter sort keys (substring)", id="sort_filter")
+        yield OptionList(*self._all_options, id="sort_picker")
+        with Horizontal():
+            yield Button("Apply", id="apply")
+            yield Button("Clear", id="clear")
+            yield Button("Cancel", id="cancel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#sort_filter", Input).focus()
+        except Exception:
+            pass
+        try:
+            picker = self.query_one("#sort_picker", OptionList)
+            if self._current_key and self._current_key in self._current_options:
+                try:
+                    picker.highlighted = self._current_options.index(self._current_key)
+                except Exception:
+                    picker.highlighted = 0
+            else:
+                picker.highlighted = 0
+        except Exception:
+            pass
+
+    def _set_picker_options(self, options: List[str]) -> None:
+        self._current_options = list(options)
+        picker = self.query_one("#sort_picker", OptionList)
+        if hasattr(picker, "clear_options"):
+            picker.clear_options()
+            picker.add_options(self._current_options)
+        else:
+            try:
+                picker.remove()
+            except Exception:
+                pass
+            try:
+                parent = self.query_one("#sort_filter", Input).parent
+                if parent is not None:
+                    parent.mount(OptionList(*self._current_options, id="sort_picker"))
+            except Exception:
+                pass
+        try:
+            picker.highlighted = 0
+        except Exception:
+            pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "sort_filter":
+            return
+        q = (event.value or "").strip().lower()
+        if not q:
+            self._set_picker_options(self._all_options)
+            return
+        filtered = [opt for opt in self._all_options if q in opt.lower()]
+        if not filtered:
+            filtered = ["(no matches)"]
+        self._set_picker_options(filtered)
+
+    def action_apply(self) -> None:
+        value = ""
+        try:
+            picker = self.query_one("#sort_picker", OptionList)
+            idx = getattr(picker, "highlighted", None)
+            if idx is None:
+                idx = 0
+            if 0 <= int(idx) < len(self._current_options):
+                chosen = self._current_options[int(idx)]
+                if chosen in {"(none)", "(no matches)"}:
+                    value = ""
+                else:
+                    value = chosen
+        except Exception:
+            value = ""
+
+        try:
+            # Update TUI sort state
+            app = self.app
+            if hasattr(app, "_sort_key"):
+                setattr(app, "_sort_key", value or None)
+            try:
+                order_widget = self.query_one("#sort_order", Select)
+                order_value = (order_widget.value or "desc").strip().lower()
+                if hasattr(app, "_sort_desc"):
+                    setattr(app, "_sort_desc", order_value != "asc")
+            except Exception:
+                pass
+            if hasattr(app, "_refresh_table"):
+                app._refresh_table()
+        except Exception:
+            pass
+        self.dismiss()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self.action_apply()
+            return
+        if event.button.id == "clear":
+            self._set_picker_options(self._all_options)
+            self.action_apply()
+            return
+        if event.button.id == "cancel":
+            self.dismiss()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.action_apply()
+
+
 class ModelsTUI(App):
     CSS = """
     Screen {
@@ -1272,24 +1896,12 @@ class ModelsTUI(App):
         self._df: Optional[pd.DataFrame] = None
         self._providers: List[str] = []
         self._applied_query: str = ""
+        self._search_fields: List[str] = ["model_id", "model_name"]
+        self._advanced_fuzzy: bool = advanced_fuzzy
+        self._min_score: int = 50
         self._table_columns: List[str] = []
         self._table_column_specs: List[Tuple[str, str]] = []
-        self._current_view: Optional[pd.DataFrame] = None
-        self._suppress_next_submit: bool = False
-        self._advanced_fuzzy: bool = advanced_fuzzy
-        self._last_filtered_count: int = 0
-        self._last_total_count: int = 0
-        self._last_shown_count: int = 0
-        self._search_fields: List[str] = ["model_id", "model_name"]
-        self._sort_keys: List[str] = [
-            "provider",
-            "model_id",
-            "model_name",
-            "context_window",
-            "input_cost",
-            "output_cost",
-            "max_output_tokens",
-        ]
+        self._sort_keys: List[str] = []
         self._sort_key: Optional[str] = None
         self._sort_desc: bool = True
         self._filter_supports_attachments: bool = False
@@ -1297,6 +1909,10 @@ class ModelsTUI(App):
         self._filter_supports_temperature: bool = False
         self._compare_rows: List[Dict[str, Any]] = []
         self._preview_enabled: bool = True
+        self._last_total_count: int = 0
+        self._last_filtered_count: int = 0
+        self._last_shown_count: int = 0
+        self._current_view: Optional[pd.DataFrame] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1317,6 +1933,12 @@ class ModelsTUI(App):
         pdf = _load_pdf()
         self._df = pdf
         self._providers = sorted(set([str(x) for x in pdf['provider'].dropna().tolist()]))
+
+        # All columns (including nested flattened '__' keys) can be used as sort keys.
+        try:
+            self._sort_keys = [str(c) for c in sorted(list(pdf.columns))]
+        except Exception:
+            self._sort_keys = []
 
         provider_widget = self.query_one("#provider", Select)
         provider_options = [("(all)", "")] + [(p, p) for p in self._providers]
@@ -1401,6 +2023,7 @@ class ModelsTUI(App):
             "/provider (/p) NAME",
             "/in id|name|both",
             "/sort KEY[:asc|:desc]",
+            "/columns (picker) | add|remove|reset SPEC",
             "/filter attachments|reasoning|temperature on|off",
             "/compare add|show|clear",
             "/af on|off",
@@ -1446,7 +2069,11 @@ class ModelsTUI(App):
                 "  /clear (/c)                Clear the search query and provider",
                 "  /provider (/p) NAME        Set provider filter (empty = all)",
                 "  /in id|name|both            Set search target",
-                "  /sort KEY[:asc|:desc]       Set sort key (context_window,input_cost,output_cost,max_output_tokens)",
+                "  /sort KEY[:asc|:desc]       Set sort key (empty: open picker)",
+                "  /columns                    Open columns picker (multi-select)",
+                "  /columns add SPEC           Add column(s) to the table (supports aliases/expansions)",
+                "  /columns remove SPEC        Remove column(s) from the table",
+                "  /columns reset              Reset table columns to defaults",
                 "  /filter NAME on|off         Toggle boolean filters (attachments, reasoning, temperature)",
                 "  /compare add|show|clear     Compare workflow",
                 "  /quit (/exit)               Quit the TUI",
@@ -1586,17 +2213,22 @@ class ModelsTUI(App):
         if query_value:
             q = query_value
 
-            def score_row(row: pd.Series) -> int:
-                tier, score = _row_best_rank(q, row, list(self._search_fields or ["model_id", "model_name"]), self._advanced_fuzzy)
-                # Encode tier into the score so that lower tier always wins.
-                # Larger is better for sort desc.
-                return (1000 - min(tier, 99)) * 1000 + score
+            def score_row(row: pd.Series) -> Tuple[int, int, int]:
+                tier, base_score = _row_best_rank(
+                    q,
+                    row,
+                    list(self._search_fields or ["model_id", "model_name"]),
+                    self._advanced_fuzzy,
+                )
+                sort_score = (1000 - min(tier, 99)) * 1000 + base_score
+                return sort_score, base_score, tier
 
             scored = pdf.copy()
-            scored["_score"] = scored.apply(score_row, axis=1)
-            scored = scored.sort_values("_score", ascending=False)
-            scored = scored[scored["_score"] > 0]
-            pdf = scored.drop(columns=["_score"], errors="ignore")
+            scored[["_sort_score", "_base_score", "_tier"]] = scored.apply(score_row, axis=1, result_type="expand")
+            scored = scored.sort_values("_sort_score", ascending=False)
+            scored = scored[scored["_base_score"] >= int(self._min_score)]
+            scored = scored[scored["_base_score"] > 0]
+            pdf = scored.drop(columns=["_sort_score", "_base_score", "_tier"], errors="ignore")
 
         # Sorting (after filtering/search)
         if self._sort_key and self._sort_key in pdf.columns:
@@ -1613,12 +2245,13 @@ class ModelsTUI(App):
         specs = [(label, src) for (label, src) in getattr(self, "_table_column_specs", []) if src in pdf.columns]
         existing_sources = [src for (_, src) in specs]
         max_rows = 200
-        view = pdf[existing_sources].head(max_rows)
-        self._current_view = view
+        full_view = pdf.head(max_rows)
+        display_view = full_view[existing_sources] if existing_sources else full_view
+        self._current_view = full_view
         self._last_total_count = total_count
         self._last_filtered_count = filtered_count
-        self._last_shown_count = int(len(view))
-        for _, row in view.iterrows():
+        self._last_shown_count = int(len(display_view))
+        for _, row in display_view.iterrows():
             rendered: List[str] = []
             for _, src in specs:
                 val = row[src]
@@ -1717,7 +2350,15 @@ class ModelsTUI(App):
             f"output_cost: {output_cost}",
             f"cost_cache_read_per_million: {cache_read}",
         ]
-        raw_json = json.dumps(row.to_dict(), indent=2, ensure_ascii=False, default=str)
+
+        row_dict = row.to_dict()
+        raw_json = "\n".join(
+            [
+                "Raw JSON",
+                "-------",
+                json.dumps(row_dict, indent=2, ensure_ascii=False, default=str),
+            ]
+        )
         self.push_screen(ModelDetailScreen(title=title, content="\n".join(summary_lines), right_content=raw_json))
 
     def _show_compare(self, left: Dict[str, Any], right: Dict[str, Any]) -> None:
@@ -1894,8 +2535,14 @@ class ModelsTUI(App):
         if cmd == "sort":
             value = (" ".join(args).strip() if args else "").strip()
             if not value:
-                self._sort_key = None
-                self._refresh_table()
+                picker = SortKeyPickerScreen(self._sort_keys, current_key=self._sort_key, desc=self._sort_desc)
+                try:
+                    self.call_after_refresh(lambda: self.push_screen(picker))
+                except Exception:
+                    try:
+                        self.call_later(lambda: self.push_screen(picker))
+                    except Exception:
+                        self.push_screen(picker)
                 _clear_query_input()
                 return True
             key = value
@@ -1923,6 +2570,79 @@ class ModelsTUI(App):
             if order in {"asc", "desc"}:
                 self._sort_desc = order == "desc"
             self._refresh_table()
+            _clear_query_input()
+            return True
+
+        if cmd in {"columns", "cols", "col"}:
+            sub = (args[0].lower().strip() if args else "").strip()
+            rest = args[1:] if len(args) > 1 else []
+
+            if not sub:
+                picker = ColumnsPickerScreen(
+                    available_columns=[str(c) for c in (list(self._df.columns) if self._df is not None else [])],
+                    selected_columns=list(self._table_columns or []),
+                )
+                try:
+                    self.call_after_refresh(lambda: self.push_screen(picker))
+                except Exception:
+                    try:
+                        self.call_later(lambda: self.push_screen(picker))
+                    except Exception:
+                        self.push_screen(picker)
+                _clear_query_input()
+                return True
+
+            if sub in {"reset", "default"}:
+                self._table_columns = [
+                    "provider",
+                    "model_id",
+                    "input_cost",
+                    "output_cost",
+                    "context_window",
+                    "max_output_tokens",
+                    "model_name",
+                ]
+                self._rebuild_table_columns()
+                self._refresh_table()
+                _clear_query_input()
+                return True
+
+            if sub in {"add", "append"}:
+                spec = " ".join(rest).strip()
+                if not spec:
+                    self.push_screen(ModelDetailScreen(title="Usage", content="/columns add SPEC"))
+                    _clear_query_input()
+                    return True
+                self._apply_column_change(spec, mode="add")
+                _clear_query_input()
+                return True
+
+            if sub in {"remove", "rm", "del"}:
+                spec = " ".join(rest).strip()
+                if not spec:
+                    self.push_screen(ModelDetailScreen(title="Usage", content="/columns remove SPEC"))
+                    _clear_query_input()
+                    return True
+                self._apply_column_change(spec, mode="remove")
+                _clear_query_input()
+                return True
+
+            current = ", ".join(self._table_columns)
+            self.push_screen(
+                ModelDetailScreen(
+                    title="Columns",
+                    content="\n".join(
+                        [
+                            f"Current: {current}",
+                            "",
+                            "Usage:",
+                            "  /columns add SPEC",
+                            "  /columns remove SPEC",
+                            "  /columns reset",
+                        ]
+                    ),
+                )
+            )
             _clear_query_input()
             return True
 
@@ -2025,6 +2745,83 @@ class ModelsTUI(App):
         )
         _clear_query_input()
         return True
+
+    def _rebuild_table_columns(self) -> None:
+        table = self.query_one("#table", DataTable)
+        try:
+            table.clear(columns=True)
+        except Exception:
+            try:
+                table.clear()
+            except Exception:
+                pass
+
+        label_map = {
+            "input_cost": "input",
+            "output_cost": "output",
+        }
+        self._table_column_specs = []
+        if self._df is None:
+            return
+        for c in self._table_columns:
+            if c in self._df.columns:
+                label = label_map.get(c, c)
+                self._table_column_specs.append((label, c))
+                try:
+                    table.add_column(label)
+                except Exception:
+                    pass
+
+    def _apply_column_change(self, spec: str, mode: str) -> None:
+        if self._df is None:
+            return
+        raw_parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+        resolved: List[str] = []
+        for part in raw_parts:
+            resolved.extend(resolve_column_spec(part, list(self._df.columns)))
+
+        out: List[str] = []
+        seen: set[str] = set()
+        for c in resolved:
+            k = str(c).lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+        if not out:
+            self.push_screen(ModelDetailScreen(title="Columns", content=f"No columns resolved from: {spec}"))
+            return
+
+        if mode == "add":
+            merged: List[str] = []
+            seen_m: set[str] = set()
+            for c in (self._table_columns or []) + out:
+                k = str(c).lower()
+                if k in seen_m:
+                    continue
+                seen_m.add(k)
+                merged.append(c)
+            self._table_columns = merged
+            self._rebuild_table_columns()
+            self._refresh_table()
+            return
+
+        if mode == "remove":
+            remove_set = {str(c).lower() for c in out}
+            self._table_columns = [c for c in (self._table_columns or []) if str(c).lower() not in remove_set]
+            if not self._table_columns:
+                self._table_columns = [
+                    "provider",
+                    "model_id",
+                    "input_cost",
+                    "output_cost",
+                    "context_window",
+                    "max_output_tokens",
+                    "model_name",
+                ]
+            self._rebuild_table_columns()
+            self._refresh_table()
+            return
 
     def _show_details_top_result(self) -> None:
         if self._current_view is None or len(self._current_view) == 0:
@@ -2148,7 +2945,9 @@ def providers(
     if fmt == "table":
         console = Console()
         resolved_box = resolve_rich_table_box(style)
-        if resolved_box is not None:
+        if _is_plain_table_style(style):
+            table = Table(title="Providers", show_header=True, header_style="bold magenta", box=None, show_edge=False)
+        elif resolved_box is not None:
             table = Table(title="Providers", show_header=True, header_style="bold magenta", box=resolved_box)
         else:
             table = Table(title="Providers", show_header=True, header_style="bold magenta")
@@ -2169,6 +2968,67 @@ def providers(
     raise typer.BadParameter("--format must be one of: comma, lines, table, json")
 
 
+@app.command("show")
+def show_cmd(
+    model_id: str = typer.Argument(..., help="Model ID to show (exact match)."),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        "-p",
+        help="Provider name (required if model_id exists in multiple providers).",
+    ),
+    format: str = typer.Option(
+        "json",
+        "--format",
+        click_type=click.Choice(["json", "lines", "table"], case_sensitive=False),
+        help="Output format: json, lines, table.",
+    ),
+):
+    """Show full raw API model data for a single model_id."""
+    fetcher = ModelDataFetcher()
+    raw = fetcher.fetch_data()
+
+    matches = _find_raw_model_records(raw, model_id=model_id, provider=provider)
+    if not matches:
+        raise typer.BadParameter(f"model_id not found: {model_id}")
+
+    if not provider and len(matches) > 1:
+        providers = ", ".join(sorted({str(m.get("provider", "")) for m in matches}))
+        raise typer.BadParameter(
+            f"model_id '{model_id}' exists in multiple providers. Use --provider. Providers: {providers}"
+        )
+
+    record = matches[0]
+    title = f"{record.get('provider')} / {record.get('model_id')}"
+    model = record.get("model")
+
+    fmt = str(format).lower()
+    if fmt == "json":
+        typer.echo(
+            json.dumps(
+                {"provider": record.get("provider"), "model_id": record.get("model_id"), "model": model},
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return
+
+    if fmt == "lines":
+        typer.echo(f"provider: {record.get('provider')}")
+        typer.echo(f"model_id: {record.get('model_id')}")
+        typer.echo(_format_kv_lines(model))
+        return
+
+    if fmt == "table":
+        if isinstance(model, dict):
+            data = {"provider": record.get("provider"), "model_id": record.get("model_id"), **model}
+            _render_kv_table(title=title, data=data)
+        else:
+            _render_kv_table(title=title, data={"provider": record.get("provider"), "model_id": record.get("model_id"), "model": model})
+        return
+
+
 @app.command("search")
 def search(
     query: str = typer.Argument(..., help="Search query for model_id/model_name."),
@@ -2185,21 +3045,29 @@ def search(
         "-pp",
         help="Use partial provider match (case-insensitive substring).",
     ),
-    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
-    column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
+    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display (0 = no limit)."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
+    sort: Optional[str] = typer.Option(None, "--sort", "-s", help='Sort results by column (e.g., "updated:desc").'),
+    column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
+    add_column: Optional[List[str]] = typer.Option(
+        None,
+        "--add-column",
+        "-C",
+        help="Additional column(s) to add to the default output. Can be specified multiple times.",
+    ),
     filters: Optional[List[str]] = typer.Option(
         None,
         "--filter",
         "-f",
         help="Additional filters (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
     ),
+    min_score: int = typer.Option(50, "--min-score", help="Exclude results with fuzzy score below this threshold (0-100)."),
     advanced_fuzzy: bool = typer.Option(False, "--advanced-fuzzy/--no-advanced-fuzzy", help="Use advanced fuzzy scoring for search (field-specific)."),
     style: str = typer.Option(
         "simple",
         "--style",
         click_type=click.Choice(STYLE_CHOICES, case_sensitive=False),
-        help="Rich table style: simple, rounded, minimal, square, ascii.",
+        help="Rich table style: simple, rounded, minimal, square, ascii, plain.",
     ),
 ):
     """Fuzzy search models by model_id/model_name (sorted by fuzzy score desc)."""
@@ -2221,42 +3089,54 @@ def search(
     if in_norm not in {"id", "name", "both"}:
         raise typer.BadParameter("--in must be one of: id, name, both")
 
-    def score_row(row: pd.Series) -> int:
+    def score_row(row: pd.Series) -> Tuple[int, int, int]:
         fields: List[str] = []
         if in_norm in {"id", "both"}:
             fields.append("model_id")
         if in_norm in {"name", "both"}:
             fields.append("model_name")
-        tier, score = _row_best_rank(q, row, fields, advanced_fuzzy)
-        return (1000 - min(tier, 99)) * 1000 + score
+        tier, base_score = _row_best_rank(q, row, fields, advanced_fuzzy)
+        sort_score = (1000 - min(tier, 99)) * 1000 + base_score
+        return sort_score, base_score, tier
 
     pdf = pdf.copy()
-    pdf['_score'] = pdf.apply(score_row, axis=1)
-    pdf = pdf.sort_values('_score', ascending=False)
-    pdf = pdf[pdf['_score'] > 0]
+    pdf[["_sort_score", "_base_score", "_tier"]] = pdf.apply(score_row, axis=1, result_type="expand")
+    pdf = pdf.sort_values("_sort_score", ascending=False)
+    pdf = pdf[pdf["_base_score"] >= int(min_score)]
+    pdf = pdf[pdf["_base_score"] > 0]
 
     # back to display columns
-    display_pdf = pdf.drop(columns=['_score'], errors='ignore')
+    display_pdf = pdf.drop(columns=["_sort_score", "_base_score", "_tier"], errors="ignore")
     display_df = fd.DataFrame(display_pdf)
     try:
         setattr(display_df, "_rich_table_style", style)
     except Exception:
         pass
 
-    columns = _select_columns(display_df, column, all_columns)
+    # Optional re-sort of search results by a concrete column (keeps fuzzy filtering semantics)
+    if sort:
+        display_df = _apply_sort(display_df, sort)
+
+    columns = _select_columns(display_df, column, add_column, all_columns)
     _render_table(display_df, columns, limit, title_prefix="Search Results")
 
 
 @app.command("list")
 def list_cmd(
     column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
+    add_column: Optional[List[str]] = typer.Option(
+        None,
+        "--add-column",
+        "-C",
+        help="Additional column(s) to add to the default output. Can be specified multiple times.",
+    ),
     filters: Optional[List[str]] = typer.Option(
         None,
         "--filter",
         "-f",
         help="Filter conditions (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
     ),
-    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
+    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display (0 = no limit)."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
     sort: Optional[str] = typer.Option(None, "--sort", "-s", help='Sort by column (e.g., "context_window:desc").'),
     provider: Optional[List[str]] = typer.Option(
@@ -2270,12 +3150,13 @@ def list_cmd(
         "simple",
         "--style",
         click_type=click.Choice(STYLE_CHOICES, case_sensitive=False),
-        help="Rich table style: simple, rounded, minimal, square, ascii.",
+        help="Rich table style: simple, rounded, minimal, square, ascii, plain.",
     ),
 ):
     """List models (same as default command)."""
     _list_models(
         column=column,
+        add_column=add_column,
         filters=filters,
         limit=limit,
         all_columns=all_columns,
@@ -2291,25 +3172,32 @@ def provider_cmd(
     provider: str = typer.Argument(..., help="Provider name."),
     partial: bool = typer.Option(True, "--partial/--exact", help="Use partial match by default."),
     column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="Column(s) to display."),
+    add_column: Optional[List[str]] = typer.Option(
+        None,
+        "--add-column",
+        "-C",
+        help="Additional column(s) to add to the default output. Can be specified multiple times.",
+    ),
     filters: Optional[List[str]] = typer.Option(
         None,
         "--filter",
         "-f",
         help="Additional filters (ops: =,==,!=,~=,~,>,>=,<,<=; ~ is regex).",
     ),
-    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display."),
+    limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of rows to display (0 = no limit)."),
     all_columns: bool = typer.Option(False, "--all-columns", help="Show all columns in the output."),
     sort: Optional[str] = typer.Option(None, "--sort", "-s", help='Sort by column (e.g., "context_window:desc").'),
     style: str = typer.Option(
         "simple",
         "--style",
         click_type=click.Choice(STYLE_CHOICES, case_sensitive=False),
-        help="Rich table style: simple, rounded, minimal, square, ascii.",
+        help="Rich table style: simple, rounded, minimal, square, ascii, plain.",
     ),
 ):
     """List models for a given provider (shortcut for list --provider...)."""
     _list_models(
         column=column,
+        add_column=add_column,
         filters=filters,
         limit=limit,
         all_columns=all_columns,

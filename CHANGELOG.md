@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Expanded the underlying DataFrame schema to include (best-effort) flattened raw model JSON fields as columns, enabling sorting/filtering/selection on non-default fields (e.g. `last_updated`, `release_date`).
+- Enhanced `--column` to support multi-column expansion aliases (e.g. `model`, `supports`, `cost`) in addition to single-column aliases.
+- Enhanced `--sort` to accept expanded aliases by using the first column of the expansion (e.g. `--sort model` sorts by `model_id`).
+- Added `--sort/-s` to `models search` to optionally re-sort the final filtered result set by a concrete column (default remains fuzzy score ranking).
+- Added boolean filter short-hands: `-f reasoning` (true) and `-f !reasoning` (false).
+- Added additional convenience aliases for common raw fields: `updated -> last_updated`, `release -> release_date`.
+- Added conservative prefix/suffix normalization for aliases (no fuzzy matching), e.g. `updated_at`/`last_updated_at` and `released_at`/`release_at`.
+- Added `--add-column/-C` to append columns to the default output without replacing it (complements `--column/-c`).
+- Improved `--all-columns` output readability by hiding nested flattened columns (those containing `__`) while keeping them available for `--sort`, `--filter`, and explicit `--column` display.
+- Enhanced TUI sorting and table customization: all DataFrame columns are available as sort keys (including `__`), `/sort` opens a sort-key picker UI, and `/columns add|remove|reset` adjusts visible columns.
+
 - Switched CLI implementation from Click to Typer.
 - Updated console script entry point to use Typer app.
 - Removed Click dependency from packaging metadata.
@@ -24,3 +35,9 @@
 - Added `--provider-partial/-pp` to `models search` for case-insensitive substring provider matching.
 - Added `--style` to `models providers` when using `--format table`.
 - Added a 24h local cache for remote `api.json` fetches with configurable TTL/path and stale-cache fallback on network errors.
+- Added `--min-score` to `models search` (default: 50) and applied the same minimum fuzzy score cutoff in the TUI search results.
+- Interpreted `--limit 0` as "no limit" across CLI commands that support `--limit`.
+- Added `--style plain` for rendering tables without borders/grids.
+- Updated the TUI model detail view layout (summary + raw JSON).
+- Added `models show MODEL_ID` to display full raw API model details with selectable output format (json/lines/table).
+- Added a header to the TUI raw JSON panel in the detail view.

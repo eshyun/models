@@ -56,6 +56,7 @@ uv tool run models [COMMAND] [OPTIONS]
 
 Options:
   -c, --column TEXT     Columns to display (can be specified multiple times)
+  -C, --add-column TEXT Additional columns to add to the default output (can be specified multiple times)
   -f, --filter TEXT     Filter conditions (e.g., "provider=openai")
   -l, --limit INTEGER   Maximum number of results to show (default: 10)
   --all-columns         Show all available columns
@@ -72,6 +73,12 @@ Show specific columns:
 models -c model_name -c provider
 ```
 
+Add extra columns to the default output:
+```bash
+models -C updated -C release
+models search gpt -C updated_at -l 20
+```
+
 Filter results:
 ```bash
 models -f "provider=openai"
@@ -84,15 +91,31 @@ Filter syntax notes:
 - Common column aliases can be used in `--column`, `--sort`, and `--filter`:
   - `id` -> `model_id`
   - `name` -> `model_name`
+  - `model` -> `model_id`, `model_name`
+  - `updated` -> `last_updated`
+    - Also accepts common variants like `updated_at`, `last_updated_at`.
+  - `release` -> `release_date`
+    - Also accepts common variants like `released`, `released_at`, `release_at`.
+  - `supports` -> `supports_attachments`, `supports_reasoning`, `supports_temperature`
+  - `cost` -> `input_cost`, `output_cost`
   - `input` -> `input_cost`
   - `output` -> `output_cost`
   - `context` -> `context_window`
   - `tokens` / `max_tokens` -> `max_output_tokens`
 
+- Boolean filters support a short form:
+  - `-f reasoning` is treated as `reasoning=true`
+  - `-f !reasoning` is treated as `reasoning=false`
+
 Show all available columns:
 ```bash
 models --all-columns
 ```
+
+Note:
+
+- `--all-columns` hides nested flattened columns (those containing `__`) for readability.
+- Those hidden columns are still available for `--sort`, `--filter`, and can be displayed explicitly via `--column`.
 
 Use a different table style:
 ```bash
@@ -104,6 +127,11 @@ Alias examples:
 models -c id -c provider -c input -c output
 models --sort context:desc
 models -f "id ~= gpt" -f "context >= 100000"
+```
+
+Sort by a non-default (raw) column:
+```bash
+models -c model,last_updated,release_date --sort last_updated:desc -l 10
 ```
 
 List providers (default: table with counts):
@@ -124,20 +152,34 @@ models providers --format comma --no-count
 Table style:
 ```bash
 models providers --style rounded
+models providers --style plain
 ```
 
 Fuzzy search:
 ```bash
 models search gpt --limit 20
+models search --min-score 50 gemini --limit 20
+models search gemini --limit 0
+models search gpt --sort updated:desc -C updated
 ```
 
 List models for a provider:
 ```bash
 models provider openai
 models list --provider openai --provider-partial
+models list --limit 0
+models list -c provider,model_id,model_name -l 20
 models search -p openrouter -p google gemini -l 10
 models search -p openrouter,google gemini -l 10
 models search -p open --provider-partial gemini -l 10
+```
+
+Show raw model details by model_id:
+```bash
+models show google/gemini-3-flash
+models show google/gemini-3-flash --format lines
+models show google/gemini-3-flash --format table
+models show gemini --provider google
 ```
 
 Launch TUI:
@@ -148,9 +190,12 @@ models --tui
 
 In the TUI:
 
+- Search results apply a minimum fuzzy score cutoff (default: 50) to reduce low-relevance noise.
+
 - Press Enter in the search box to show details for the top result.
 - Press Enter on a selected table row to show details for that model.
 - The detail view includes `input_cost` and `output_cost`.
+- The detail view shows a summary on the left and raw JSON on the right.
 - A status bar shows the current provider/query/row counts and `advanced_fuzzy` mode.
 - A split-view preview panel shows a quick summary for the highlighted row (toggle with `p`).
 - Typing `/` in the search box shows a small command palette with matching commands.

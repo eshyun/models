@@ -18,9 +18,9 @@
   - `models tui` (Textual-based interactive TUI)
 
 - Common options (list/provider):
-  - `--column/-c` (repeatable)
+  - `--column/-c` (repeatable; also supports comma-separated lists)
   - `--filter/-f` (repeatable; supports `=`, `==`, `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`; operator whitespace is allowed)
-  - `--limit/-l`
+  - `--limit/-l` (`0` means no limit)
   - `--all-columns`
   - `--sort/-s` (supports `:asc`/`:desc`)
   - Column aliases are supported in `--column`, `--sort`, and `--filter` (e.g. `id`, `name`, `input`, `output`, `context`, `tokens`, `max_tokens`).
@@ -30,12 +30,20 @@
   - `-p/--provider` is repeatable and also supports comma-separated lists (e.g. `-p openrouter -p google` or `-p openrouter,google`).
   - Exact matching is the default; `--provider-partial/-pp` enables case-insensitive substring matching.
 
+- Fuzzy search cutoff:
+  - `models search` supports `--min-score` (default: 50) to exclude low-relevance fuzzy matches.
+  - The TUI applies the same default minimum score cutoff (50) when a query is present.
+
 ## Data flow
 
 - `ModelDataFetcher` fetches JSON from `https://models.dev/api.json`.
  - `ModelDataFetcher.fetch_data()` caches the fetched JSON on disk (default: `~/.cache/models/api.json`) with a configurable TTL (default: 24 hours). If the remote fetch fails, it falls back to the cached file when available.
    - Env: `MODELS_CACHE_PATH`, `MODELS_CACHE_TTL_SECONDS`
 - Data is flattened into records and converted into a DataFrame for filtering/sorting.
+ - Flattening strategy:
+   - `ModelDataFetcher._flatten_model_data()` keeps the stable “core columns” (`model_id`, `model_name`, `provider`, costs, limits, supports_*).
+   - It additionally flattens the raw model JSON object into extra columns using a `__` separator for nested keys (best-effort), so that raw fields can be used with `--column`, `--filter`, and `--sort` (e.g. `last_updated`, `release_date`, `modalities__input`).
+   - Non-scalar values (lists/dicts) are serialized to JSON strings for safe table display and consistent filtering.
 - Results are rendered using `rich.Table`.
  - The selected Rich table style (`--style`) is threaded into rendering explicitly so it remains consistent even if filtering/sorting creates a new DataFrame.
  - Fuzzy search uses `rapidfuzz.fuzz.WRatio` over `model_id` and/or `model_name`.
@@ -45,7 +53,37 @@
  - The TUI defines key bindings for help (`?`), clear search (`Esc`), refresh (`r`), and focus cycling (`Tab`).
  - TUI table cost columns use fixed-decimal formatting for consistent scanning.
  - TUI supports keyboard-driven exploration features (sorting, search target selection, capability filters) and a compare mode for two models.
- - TUI slash commands include `/quit` and `/exit` for exiting the app.
- - TUI layout uses a split view (table + preview panel) that can be toggled with `p`, and shows a simple command palette when typing `/`.
- - The detail screen can render in two columns (summary on the left, raw JSON on the right).
+- TUI slash commands include `/quit` and `/exit` for exiting the app.
+ - TUI sorting:
+   - The TUI sort key supports all available columns in the loaded DataFrame (including nested flattened columns containing `__`).
+   - `/sort` with no args opens a picker UI for selecting a sort key.
+ - TUI table columns:
+   - `/columns add SPEC` appends columns to the current table.
+   - `/columns remove SPEC` removes columns from the current table.
+   - `/columns reset` restores the default table column set.
+- TUI layout uses a split view (table + preview panel) that can be toggled with `p`, and shows a simple command palette when typing `/`.
+ - The detail screen renders in two columns (summary on the left, raw JSON on the right).
  - Advanced fuzzy scoring can be enabled via `--advanced-fuzzy` (CLI) or `/af on|off` in the TUI.
+
+## Column selection / aliases
+
+- `--column` parsing supports repeated flags and comma-separated lists.
+- `--column/-c` replaces the default output columns with the user-specified set.
+- `--add-column/-C` adds columns to the default output without replacing it (useful for “show me everything plus X”).
+- Column specs support both:
+  - single-column aliases (e.g. `id -> model_id`)
+  - multi-column expansions (e.g. `model -> model_id,model_name`, `supports -> supports_attachments,supports_reasoning,supports_temperature`, `cost -> input_cost,output_cost`).
+- Prefix/suffix normalization (conservative, no fuzzy matching): common variants like `updated_at`, `last_updated_at`, `released_at` are normalized to the stable alias tokens `updated`/`release` before applying alias/expansion rules.
+
+## Sorting
+
+- `--sort` accepts raw column names or aliases.
+- If an alias expands to multiple columns, the sort key uses the first column of the expansion (e.g. `--sort model` sorts by `model_id`).
+- `models search` uses fuzzy scoring to rank matches by default, but also supports `--sort` to re-sort the final filtered result set by a concrete column.
+
+## Filtering
+
+- Filter expressions support operators: `=`, `==`, `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`.
+- Boolean short-hands are supported:
+  - `reasoning` is treated as `reasoning=true`
+  - `!reasoning` is treated as `reasoning=false`

@@ -5,6 +5,7 @@ import pandas as pd
 
 import json
 from pathlib import Path
+from typer.testing import CliRunner
 
 
 def _import_main():
@@ -73,6 +74,12 @@ def test_parse_provider_values_supports_commas_and_dedup():
     assert m._parse_provider_values(["openrouter, google", "OpenRouter"]) == ["openrouter", "google"]
 
 
+def test_parse_column_values_supports_commas_and_dedup():
+    m = _import_main()
+    assert m._parse_column_values(["provider,model_id"]) == ["provider", "model_id"]
+    assert m._parse_column_values(["provider, model_id", "provider"]) == ["provider", "model_id"]
+
+
 def test_filter_pdf_by_providers_partial_match():
     m = _import_main()
     pdf = pd.DataFrame(
@@ -105,6 +112,74 @@ def test_column_alias_resolution_in_filter_and_sort():
     sorted_df = m._apply_sort(df, "context:desc")
     sorted_pdf = sorted_df.to_pandas() if hasattr(sorted_df, "to_pandas") else pd.DataFrame(sorted_df)
     assert sorted_pdf["context_window"].tolist() == [200, 100]
+
+
+def test_column_alias_prefix_suffix_normalization_updated_release():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {
+                "model_id": "a",
+                "model_name": "A",
+                "provider": "p",
+                "last_updated": "2025-01-01",
+                "release_date": "2024-01-01",
+            },
+            {
+                "model_id": "b",
+                "model_name": "B",
+                "provider": "p",
+                "last_updated": "2026-01-01",
+                "release_date": "2023-01-01",
+            },
+        ]
+    )
+    df = m.fd.DataFrame(pdf)
+
+    # updated_at -> last_updated
+    sorted_df = m._apply_sort(df, "updated_at:desc")
+    sorted_pdf = sorted_df.to_pandas() if hasattr(sorted_df, "to_pandas") else pd.DataFrame(sorted_df)
+    assert sorted_pdf["model_id"].tolist() == ["b", "a"]
+
+    # released_at -> release_date (ascending default)
+    sorted_df2 = m._apply_sort(df, "released_at")
+    sorted_pdf2 = sorted_df2.to_pandas() if hasattr(sorted_df2, "to_pandas") else pd.DataFrame(sorted_df2)
+    assert sorted_pdf2["release_date"].tolist() == ["2023-01-01", "2024-01-01"]
+
+    # Column spec expansion should preserve canonical column names
+    cols = m._select_columns(df, ["updated_at", "released"], add_column=None, all_columns=False)
+    assert cols == ["last_updated", "release_date"]
+
+
+def test_add_column_appends_to_default_output_and_allows_hidden_nested_cols():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {
+                "provider": "p",
+                "model_id": "a",
+                "model_name": "A",
+                "input_cost": 1.0,
+                "output_cost": 2.0,
+                "context_window": 100,
+                "max_output_tokens": 10,
+                "last_updated": "2025-01-01",
+                "modalities__input": "[\"text\"]",
+            }
+        ]
+    )
+    df = m.fd.DataFrame(pdf)
+
+    # Default columns + add updated (alias) and a hidden nested column
+    cols = m._select_columns(df, column=None, add_column=["updated", "modalities__input"], all_columns=False)
+    # Must start with defaults
+    assert cols[: len(m.get_default_display_columns())] == m.get_default_display_columns()
+    assert "last_updated" in cols
+    assert "modalities__input" in cols
+
+    # If --column is used, it still replaces the full set (add_column appends to that set)
+    cols2 = m._select_columns(df, column=["model"], add_column=["updated"], all_columns=False)
+    assert cols2 == ["model_id", "model_name", "last_updated"]
 
 
 def test_normalize_query_llm_naming_separators_and_digits():
@@ -217,6 +292,124 @@ def test_fetch_data_uses_cache_when_fresh(monkeypatch, tmp_path):
     fetcher = m.ModelDataFetcher()
     out = fetcher.fetch_data()
     assert out == {"cached": True}
+
+
+def test_cli_show_outputs_json_for_model_id(monkeypatch):
+    m = _import_main()
+
+    fake_raw = {
+        "google": {
+            "models": {
+                "gemini": {"name": "Gemini", "family": "llama", "attachment": False},
+            }
+        }
+    }
+
+    monkeypatch.setattr(m.ModelDataFetcher, "fetch_data", lambda self: fake_raw)
+
+    runner = CliRunner()
+    result = runner.invoke(m.app, ["show", "gemini", "--format", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["provider"] == "google"
+    assert payload["model_id"] == "gemini"
+    assert payload["model"]["family"] == "llama"
+
+
+def test_cli_show_requires_provider_when_ambiguous(monkeypatch):
+    m = _import_main()
+
+    fake_raw = {
+        "google": {"models": {"x": {"name": "X"}}},
+        "openai": {"models": {"x": {"name": "X2"}}},
+    }
+
+    monkeypatch.setattr(m.ModelDataFetcher, "fetch_data", lambda self: fake_raw)
+
+    runner = CliRunner()
+    result = runner.invoke(m.app, ["show", "x"])
+    assert result.exit_code != 0
+    combined = (result.stdout or "") + (getattr(result, "stderr", "") or "") + (result.output or "")
+    assert "exists in multiple providers" in combined
+
+
+def test_cli_search_min_score_filters_low_score_rows():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {"provider": "google", "model_id": "gemini-3-flash", "model_name": "Gemini 3 Flash"},
+            {"provider": "google", "model_id": "totally-unrelated", "model_name": "Something Else"},
+        ]
+    )
+
+    q = "gemini3 flash"
+    fields = ["model_id", "model_name"]
+
+    def base_score(row: pd.Series) -> int:
+        _, s = m._row_best_rank(q, row, fields, advanced_fuzzy=False)
+        return int(s)
+
+    scores = pdf.apply(base_score, axis=1)
+    # sanity: the relevant row should score higher than the unrelated row
+    assert scores.iloc[0] > scores.iloc[1]
+
+    # With a high min_score, only the relevant row remains
+    min_score = max(0, int(scores.iloc[0]))
+    filtered = pdf[scores >= min_score]
+    assert set(filtered["model_id"].tolist()) == {"gemini-3-flash"}
+
+
+def test_limit_zero_means_no_limit(monkeypatch):
+    m = _import_main()
+
+    df = m.fd.DataFrame(
+        pd.DataFrame(
+            [
+                {"provider": "a", "model_id": "1", "model_name": "One"},
+                {"provider": "b", "model_id": "2", "model_name": "Two"},
+            ]
+        )
+    )
+    columns = ["provider", "model_id", "model_name"]
+
+    captured = {}
+
+    def fake_display_results(data, cols, title, style=None):
+        captured["data"] = data
+        captured["cols"] = cols
+        captured["title"] = title
+
+    monkeypatch.setattr(m, "display_results", fake_display_results)
+    m._render_table(df, columns, limit=0, title_prefix="Test")
+    assert len(captured["data"]) == 2
+
+
+def test_style_plain_is_supported_and_renders_without_box_chars():
+    m = _import_main()
+    assert "plain" in m.STYLE_CHOICES
+
+    captured = {}
+
+    real_table = m.Table
+
+    def fake_table(*args, **kwargs):
+        captured["kwargs"] = dict(kwargs)
+        return real_table(*args, **kwargs)
+
+    # display_results imports Table at module scope, so patching m.Table is enough.
+    m.Table = fake_table
+    try:
+        m.display_results(
+            data=[{"provider": "a", "model_id": "1"}],
+            columns=["provider", "model_id"],
+            title="T",
+            style="plain",
+        )
+    finally:
+        m.Table = real_table
+
+    assert captured["kwargs"].get("box") is None
+    assert captured["kwargs"].get("show_edge") is False
 
 
 def test_fetch_data_ttl_zero_forces_remote(monkeypatch, tmp_path):
