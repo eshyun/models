@@ -1548,6 +1548,7 @@ def _render_table(
     limit: int,
     title_prefix: str = "Model Data",
     style: Optional[str] = None,
+    total_rows: Optional[int] = None,
 ):
     base_cols = [c for c in columns if c != "__cost_in_out__"]
     required = list(base_cols)
@@ -1615,7 +1616,7 @@ def _render_table(
     display_results(
         display_data,
         [c for c in columns if c in display_df.columns],
-        f"{title_prefix} (showing {len(display_data)} of {len(df)} models)",
+        f"{title_prefix} (showing {len(display_data)} of {int(total_rows) if total_rows is not None else len(df)} models)",
         style=style or getattr(df, "_rich_table_style", None),
         column_labels=column_labels,
     )
@@ -3482,8 +3483,20 @@ def search(
     except Exception:
         pass
 
-    # Optional re-sort of search results by a concrete column (keeps fuzzy filtering semantics)
-    if sort:
+    # Optional re-sort of search results by a concrete column.
+    # Workaround: if a limit is provided, apply limit FIRST (on fuzzy-score ordering),
+    # then sort only within that limited subset. This avoids pushing high-score matches
+    # out of the window due to the secondary sort.
+    total_rows = len(display_pdf)
+    limited_then_sorted = False
+    if sort and limit is not None and int(limit) > 0:
+        try:
+            display_df = display_df.head(int(limit))
+        except Exception:
+            pass
+        display_df = _apply_sort(display_df, sort)
+        limited_then_sorted = True
+    elif sort:
         display_df = _apply_sort(display_df, sort)
 
     columns = _select_columns(
@@ -3493,7 +3506,15 @@ def search(
         all_columns,
         provider_filter_applied=provider_filter_applied,
     )
-    _render_table(display_df, columns, limit, title_prefix="Search Results", style=style)
+    render_limit = 0 if limited_then_sorted else limit
+    _render_table(
+        display_df,
+        columns,
+        render_limit,
+        title_prefix="Search Results",
+        style=style,
+        total_rows=total_rows,
+    )
 
 
 @app.command("list")

@@ -475,6 +475,53 @@ def test_cli_search_with_filters_that_match_nothing_does_not_crash(monkeypatch):
     assert result.exit_code == 0
 
 
+def test_cli_search_limit_is_applied_before_secondary_sort(monkeypatch):
+    m = _import_main()
+
+    # Construct data such that the best fuzzy match is "gpt-4.1" (score order),
+    # but secondary sort (updated:desc) would otherwise push it out of the top-N.
+    fake_raw = {
+        "openrouter": {
+            "models": {
+                "gpt-4.1": {"name": "GPT-4.1", "last_updated": "2020-01-01"},
+                "zzz": {"name": "ZZZ", "last_updated": "2030-01-01"},
+                "yyy": {"name": "YYY", "last_updated": "2029-01-01"},
+            }
+        }
+    }
+
+    monkeypatch.setattr(m.ModelDataFetcher, "fetch_data", lambda self: fake_raw)
+
+    captured = {}
+
+    def fake_display_results(data, cols, title, style=None, column_labels=None):
+        captured["data"] = data
+        captured["cols"] = cols
+        captured["title"] = title
+
+    monkeypatch.setattr(m, "display_results", fake_display_results)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        m.app,
+        [
+            "search",
+            "-p",
+            "openrouter",
+            "--limit",
+            "1",
+            "--sort",
+            "updated:desc",
+            "gpt-4.1",
+        ],
+    )
+    assert result.exit_code == 0
+
+    # With limit-first semantics, the best fuzzy match must remain visible.
+    assert len(captured.get("data") or []) == 1
+    assert captured["data"][0]["model_id"] == "gpt-4.1"
+
+
 def test_limit_zero_means_no_limit(monkeypatch):
     m = _import_main()
 

@@ -172,7 +172,13 @@ models search gpt --limit 20
 models search --min-score 50 gemini --limit 20
 models search gemini --limit 0
 models search gpt --sort updated:desc -C updated
+models search -p openrouter --sort updated:desc --limit 10 'gpt-4.1'
 ```
+
+Note on `models search --sort` + `--limit`:
+
+- When `--sort` is provided together with a positive `--limit`, the tool first takes the top `--limit` matches by fuzzy score (default ranking), then applies the requested `--sort` only within that limited subset.
+- This prevents highly relevant fuzzy matches from being pushed out of the visible window due to the secondary sort.
 
 List models for a provider:
 ```bash

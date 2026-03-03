@@ -86,7 +86,8 @@
 
 - `--sort` accepts raw column names or aliases.
 - If an alias expands to multiple columns, the sort key uses the first column of the expansion (e.g. `--sort model` sorts by `model_id`).
-- `models search` uses fuzzy scoring to rank matches by default, but also supports `--sort` to re-sort the final filtered result set by a concrete column.
+- `models search` uses fuzzy scoring to rank matches by default, but also supports `--sort` to apply a secondary sort by a concrete column.
+ - When `--sort` is used together with a positive `--limit`, `models search` applies `--limit` first (top-N by fuzzy score) and then sorts within that subset. This prevents high-relevance fuzzy matches from being pushed out of the visible window by the secondary sort.
 
 ## Filtering
 
