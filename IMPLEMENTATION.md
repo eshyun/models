@@ -62,6 +62,7 @@
    - `/columns remove SPEC` removes columns from the current table.
    - `/columns reset` restores the default table column set.
 - TUI layout uses a split view (table + preview panel) that can be toggled with `p`, and shows a simple command palette when typing `/`.
+ - The TUI preview panel renders highlighted-row fields as a 2-column DataTable (`field`, `value`).
  - The detail screen renders in two columns (summary on the left, raw JSON on the right).
  - Advanced fuzzy scoring can be enabled via `--advanced-fuzzy` (CLI) or `/af on|off` in the TUI.
 

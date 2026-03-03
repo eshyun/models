@@ -208,7 +208,7 @@ In the TUI:
 - The detail view includes `input_cost` and `output_cost`.
 - The detail view shows a summary on the left and raw JSON on the right.
 - A status bar shows the current provider/query/row counts and `advanced_fuzzy` mode.
-- A split-view preview panel shows a quick summary for the highlighted row (toggle with `p`).
+- A split-view preview panel shows key model fields in a small 2-column table for the highlighted row (toggle with `p`).
 - Typing `/` in the search box shows a small command palette with matching commands.
 - The chips line below the search box shows the active provider filter and other toggles (search target, sort, filters, compare, preview).
 

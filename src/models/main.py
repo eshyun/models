@@ -2240,6 +2240,7 @@ class ModelsTUI(App):
         with Horizontal(id="main"):
             yield DataTable(id="table")
             with VerticalScroll(id="preview"):
+                yield DataTable(id="preview_table")
                 yield Static("", id="preview_text")
         yield Static("", id="status")
         yield Footer()
@@ -2265,6 +2266,20 @@ class ModelsTUI(App):
 
         table = self.query_one("#table", DataTable)
         table.cursor_type = "row"
+
+        preview_table = self.query_one("#preview_table", DataTable)
+        preview_table.add_column("field")
+        preview_table.add_column("value")
+        preview_table.cursor_type = "row"
+        try:
+            preview_table.show_header = True
+        except Exception:
+            pass
+
+        try:
+            self.query_one("#preview_text", Static).display = False
+        except Exception:
+            pass
 
         self._table_columns = [
             "provider",
@@ -2618,12 +2633,13 @@ class ModelsTUI(App):
             return
 
         try:
-            widget = self.query_one("#preview_text", Static)
+            preview_table = self.query_one("#preview_table", DataTable)
         except Exception:
             return
 
         if self._current_view is None or len(self._current_view) == 0:
-            widget.update("(no rows)")
+            preview_table.clear()
+            preview_table.add_row("(no rows)", "")
             return
 
         idx = 0
@@ -2639,7 +2655,23 @@ class ModelsTUI(App):
             idx = 0
 
         row = self._current_view.iloc[idx].to_dict()
-        widget.update(self._render_row_summary(row))
+        preview_table.clear()
+
+        def add_kv(field: str, value: Any) -> None:
+            if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+                rendered = ""
+            else:
+                rendered = str(value)
+            preview_table.add_row(str(field), rendered)
+
+        add_kv("provider", row.get("provider", ""))
+        add_kv("model_id", row.get("model_id", ""))
+        add_kv("model_name", row.get("model_name", ""))
+        add_kv("context_window", format_int_with_commas(row.get("context_window", None)))
+        add_kv("max_output_tokens", format_int_with_commas(row.get("max_output_tokens", None)))
+        add_kv("input_cost", format_cost_fixed(row.get("input_cost", None), decimals=4))
+        add_kv("output_cost", format_cost_fixed(row.get("output_cost", None), decimals=4))
+        add_kv("cost_cache_read_per_million", format_cost_fixed(row.get("cost_cache_read_per_million", None), decimals=4))
 
     def _show_details_for_row(self, row: pd.Series) -> None:
         provider = str(row.get('provider', '') or '')

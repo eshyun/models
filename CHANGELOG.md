@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Updated the TUI preview panel to render highlighted-row fields as a key/value table.
 - Changed default table output columns across list/search to: provider, id, cost(in/out), context, name, updated.
 - When a provider filter is applied via `--provider/-p`, the default output omits the `provider` column.
 - Combined `input_cost` and `output_cost` into a synthetic `cost(in/out)` column in the default output.
