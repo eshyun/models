@@ -88,6 +88,8 @@ Filter syntax notes:
 
 - Operators support optional spaces (e.g. `provider ~= openrou`).
 - Supported operators: `=`, `==` (alias of `=`), `!=`, `~=`, `~`, `>`, `>=`, `<`, `<=`.
+- Numeric comparisons support human-readable suffixes for numeric columns (e.g. `4K`, `1.0M`, `2B`, `1T`) and commas (e.g. `4,096`).
+- Date comparisons are supported on date-like columns (e.g. `release_date`, `last_updated`) using `dateparser.parse()` (e.g. `release_date >= 2026-03-01`, `release_date >= 1 month ago`).
 - Common column aliases can be used in `--column`, `--sort`, and `--filter`:
   - `id` -> `model_id`
   - `name` -> `model_name`
@@ -127,6 +129,9 @@ Alias examples:
 models -c id -c provider -c input -c output
 models --sort context:desc
 models -f "id ~= gpt" -f "context >= 100000"
+models list -p openrouter --sort release_date:desc --filter "context_window=1.0M"
+models list -p openrouter --sort release_date:desc --filter "context >= 4096"
+models list -p openrouter --sort release_date:desc --filter "release_date >= 2026-03-01"
 ```
 
 Sort by a non-default (raw) column:

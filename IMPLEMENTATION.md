@@ -87,3 +87,12 @@
 - Boolean short-hands are supported:
   - `reasoning` is treated as `reasoning=true`
   - `!reasoning` is treated as `reasoning=false`
+
+- Numeric parsing:
+  - For numeric columns (int/float), filter values accept human-readable suffixes: `K`, `M`, `B`/`G`, `T`.
+  - Commas are ignored (e.g. `4,096` -> `4096`).
+
+- Date parsing:
+  - Date-like columns (e.g. `release_date`, `last_updated`, and common `*_date`/`*_at` patterns) support comparisons with `=`, `!=`, `<`, `<=`, `>`, `>=`.
+  - Values are parsed with `dateparser.parse()` (supports absolute dates like `2026-03-01` and relative expressions like `1 month ago`).
+  - If parsing fails for the filter value, filtering falls back to string comparison and emits a warning.

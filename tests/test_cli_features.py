@@ -51,6 +51,66 @@ def test_apply_filters_allows_operator_whitespace_and_eqeq():
     assert set(out_pdf["model_id"].tolist()) == {"gpt-4.1"}
 
 
+def test_apply_filters_parses_human_numbers_for_all_numeric_columns():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {"provider": "p", "context_window": 4096, "max_output_tokens": 1000, "model_id": "a", "model_name": "A"},
+            {"provider": "p", "context_window": 8192, "max_output_tokens": 2000, "model_id": "b", "model_name": "B"},
+            {"provider": "p", "context_window": 1_000_000, "max_output_tokens": 3000, "model_id": "c", "model_name": "C"},
+        ]
+    )
+
+    df = m.fd.DataFrame(pdf)
+
+    out1 = m._apply_filters(df, ["context_window >= 1.0M"])
+    out1_pdf = out1.to_pandas() if hasattr(out1, "to_pandas") else pd.DataFrame(out1)
+    assert set(out1_pdf["model_id"].tolist()) == {"c"}
+
+    out2 = m._apply_filters(df, ["max_output_tokens >= 2K"])
+    out2_pdf = out2.to_pandas() if hasattr(out2, "to_pandas") else pd.DataFrame(out2)
+    assert set(out2_pdf["model_id"].tolist()) == {"b", "c"}
+
+    out3 = m._apply_filters(df, ["context >= 8192"])
+    out3_pdf = out3.to_pandas() if hasattr(out3, "to_pandas") else pd.DataFrame(out3)
+    assert set(out3_pdf["model_id"].tolist()) == {"b", "c"}
+
+
+def test_apply_filters_token_count_columns_accept_decimal_or_binary_multipliers_on_eq():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {"provider": "p", "context_window": 1_000_000, "model_id": "dec", "model_name": "Dec"},
+            {"provider": "p", "context_window": 1_048_576, "model_id": "bin", "model_name": "Bin"},
+            {"provider": "p", "context_window": 2_000_000, "model_id": "other", "model_name": "Other"},
+        ]
+    )
+    df = m.fd.DataFrame(pdf)
+    out = m._apply_filters(df, ["context_window = 1M"])
+    out_pdf = out.to_pandas() if hasattr(out, "to_pandas") else pd.DataFrame(out)
+    assert set(out_pdf["model_id"].tolist()) == {"dec", "bin"}
+
+
+def test_apply_filters_supports_date_comparisons_on_release_date():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {"provider": "p", "model_id": "a", "model_name": "A", "release_date": "2026-02-28"},
+            {"provider": "p", "model_id": "b", "model_name": "B", "release_date": "2026-03-01"},
+            {"provider": "p", "model_id": "c", "model_name": "C", "release_date": "2026-03-05"},
+        ]
+    )
+
+    df = m.fd.DataFrame(pdf)
+    out = m._apply_filters(df, ["release_date >= 2026-03-01"])
+    out_pdf = out.to_pandas() if hasattr(out, "to_pandas") else pd.DataFrame(out)
+    assert set(out_pdf["model_id"].tolist()) == {"b", "c"}
+
+    out2 = m._apply_filters(df, ["release_date < 2026-03-05"])
+    out2_pdf = out2.to_pandas() if hasattr(out2, "to_pandas") else pd.DataFrame(out2)
+    assert set(out2_pdf["model_id"].tolist()) == {"a", "b"}
+
+
 def test_multi_provider_filter_union_semantics():
     m = _import_main()
     pdf = pd.DataFrame(
@@ -357,6 +417,37 @@ def test_cli_search_min_score_filters_low_score_rows():
     min_score = max(0, int(scores.iloc[0]))
     filtered = pdf[scores >= min_score]
     assert set(filtered["model_id"].tolist()) == {"gemini-3-flash"}
+
+
+def test_cli_search_with_filters_that_match_nothing_does_not_crash(monkeypatch):
+    m = _import_main()
+
+    fake_raw = {
+        "openrouter": {
+            "models": {
+                "gemini": {"name": "Gemini", "release_date": "2020-01-01"},
+            }
+        }
+    }
+
+    monkeypatch.setattr(m.ModelDataFetcher, "fetch_data", lambda self: fake_raw)
+
+    # Patch renderer to avoid output assumptions; we only care about not crashing.
+    monkeypatch.setattr(m, "display_results", lambda *a, **k: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        m.app,
+        [
+            "search",
+            "-p",
+            "openrouter",
+            "--filter",
+            "release_date > 3m",
+            "gemini",
+        ],
+    )
+    assert result.exit_code == 0
 
 
 def test_limit_zero_means_no_limit(monkeypatch):

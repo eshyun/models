@@ -1065,8 +1065,9 @@ def _load_df() -> fd.DataFrame:
 
 def _load_pdf() -> pd.DataFrame:
     fetcher = ModelDataFetcher()
-    fetcher.fetch_data()
-    raw = fetcher._raw_data or {}
+    raw = fetcher.fetch_data() or {}
+    if not isinstance(raw, dict):
+        raw = {}
 
     records: List[Dict[str, Any]] = []
     for provider, provider_data in raw.items():
@@ -1082,6 +1083,114 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
         return df
 
     import re
+
+    def _parse_human_number(raw: str) -> Optional[float]:
+        s = (raw or "").strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([KkMmBbTtGg]?)$", s)
+        if not m:
+            return None
+        num = float(m.group(1))
+        suf = (m.group(2) or "").lower()
+        mult = {
+            "": 1.0,
+            "k": 1_000.0,
+            "m": 1_000_000.0,
+            "b": 1_000_000_000.0,
+            "g": 1_000_000_000.0,
+            "t": 1_000_000_000_000.0,
+        }.get(suf)
+        if mult is None:
+            return None
+        return num * mult
+
+    def _is_date_like_column(column_name: str) -> bool:
+        c = (column_name or "").strip().lower()
+        if not c:
+            return False
+        if c in {"release_date", "last_updated"}:
+            return True
+        k = _normalize_column_alias_key(c)
+        if k in {"release", "updated"}:
+            return True
+        return c.endswith("_date") or c.endswith("_at")
+
+    def _as_pandas(df_any: Any) -> pd.DataFrame:
+        if hasattr(df_any, "to_pandas"):
+            return df_any.to_pandas()
+        if isinstance(df_any, pd.DataFrame):
+            return df_any
+        return pd.DataFrame(df_any)
+
+    def _normalize_relative_date_expr(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return s
+        # Common shorthand used in CLI filters: treat `3m` as `3 months ago` (months, not minutes).
+        m = re.match(r"^([+-]?\d+)\s*[mM]\s*$", s)
+        if m:
+            return f"{m.group(1)} months ago"
+        # Also interpret `3 months` (without 'ago') as a past-relative duration.
+        m2 = re.match(r"^([+-]?\d+)\s*(month|months|mo)\s*$", s, flags=re.IGNORECASE)
+        if m2:
+            return f"{m2.group(1)} months ago"
+        # Interpret `3 weeks`, `10 days`, etc. (without 'ago') as past-relative.
+        m3 = re.match(r"^([+-]?\d+)\s*(day|days|week|weeks|year|years)\s*$", s, flags=re.IGNORECASE)
+        if m3:
+            unit = m3.group(2).lower()
+            return f"{m3.group(1)} {unit} ago"
+        return s
+
+    def _dtype_is_int(dtype: Any) -> bool:
+        try:
+            import pandas.api.types as ptypes
+
+            return bool(ptypes.is_integer_dtype(dtype))
+        except Exception:
+            s = str(dtype)
+            return s.lower().startswith("int")
+
+    def _dtype_is_float(dtype: Any) -> bool:
+        try:
+            import pandas.api.types as ptypes
+
+            return bool(ptypes.is_float_dtype(dtype))
+        except Exception:
+            s = str(dtype)
+            return s.lower().startswith("float")
+
+    def _is_token_count_column(column_name: str) -> bool:
+        c = (column_name or "").strip().lower()
+        return c in {"context_window", "max_output_tokens"}
+
+    def _parse_human_number_binary_if_applicable(raw: str) -> Optional[float]:
+        """Parse human numbers using 1024-based multipliers.
+
+        This is useful for token-count columns where upstream sources sometimes
+        use power-of-two values (e.g. 1,048,576).
+        """
+        s = (raw or "").strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([KkMmBbTtGg]?)$", s)
+        if not m:
+            return None
+        num = float(m.group(1))
+        suf = (m.group(2) or "").lower()
+        mult = {
+            "": 1.0,
+            "k": 1024.0,
+            "m": 1024.0 ** 2,
+            "b": 1024.0 ** 3,
+            "g": 1024.0 ** 3,
+            "t": 1024.0 ** 4,
+        }.get(suf)
+        if mult is None:
+            return None
+        return num * mult
 
     def _parse_filter(expr: str) -> Optional[Tuple[str, str, str]]:
         """Parse filter expression allowing spaces around operators.
@@ -1122,6 +1231,72 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
             typer.echo(f"Warning: Unknown column '{col}' in filter", err=True)
             continue
 
+        # Date filters (vectorized on pandas; fallback to string compare on parse failure)
+        if op in {"=", "!=", ">=", "<=", ">", "<"} and _is_date_like_column(resolved_col):
+            try:
+                import dateparser
+            except Exception:
+                dateparser = None
+
+            pdf = _as_pandas(df)
+            raw_val = _normalize_relative_date_expr((val or "").strip())
+            parsed_val = (
+                dateparser.parse(raw_val, settings={"PREFER_DATES_FROM": "past"})
+                if dateparser
+                else None
+            )
+            if parsed_val is None:
+                typer.echo(
+                    f"Warning: Could not parse date value '{val}' for column '{col}', falling back to string comparison",
+                    err=True,
+                )
+                s_left = pdf[resolved_col].astype(str)
+                s_right = str(raw_val)
+                if op == "=":
+                    mask = s_left == s_right
+                elif op == "!=":
+                    mask = s_left != s_right
+                elif op == ">=":
+                    mask = s_left >= s_right
+                elif op == "<=":
+                    mask = s_left <= s_right
+                elif op == ">":
+                    mask = s_left > s_right
+                else:
+                    mask = s_left < s_right
+            else:
+                target = pd.Timestamp(parsed_val)
+
+                def _cell_to_ts(x: Any):
+                    if x is None or (isinstance(x, float) and pd.isna(x)):
+                        return pd.NaT
+                    if isinstance(x, (pd.Timestamp,)):
+                        return x
+                    if isinstance(x, str) and not x.strip():
+                        return pd.NaT
+                    if not dateparser:
+                        return pd.NaT
+                    dt = dateparser.parse(str(x), settings={"PREFER_DATES_FROM": "past"})
+                    return pd.Timestamp(dt) if dt is not None else pd.NaT
+
+                left = pdf[resolved_col].apply(_cell_to_ts)
+                if op == "=":
+                    mask = left == target
+                elif op == "!=":
+                    mask = left != target
+                elif op == ">=":
+                    mask = left >= target
+                elif op == "<=":
+                    mask = left <= target
+                elif op == ">":
+                    mask = left > target
+                else:
+                    mask = left < target
+
+            pdf = pdf[mask]
+            df = fd.DataFrame(pdf) if isinstance(df, fd.DataFrame) else pdf
+            continue
+
         # Partial match
         if op == "~=":
             df = df[df[resolved_col].astype(str).str.contains(re.escape(val), case=False, na=False)]
@@ -1137,38 +1312,56 @@ def _apply_filters(df: fd.DataFrame, filters: Optional[List[str]]) -> fd.DataFra
 
         # Typed conversions (best-effort)
         typed_val: Any = val
+        typed_val_candidates: Optional[List[Any]] = None
         try:
-            if df[resolved_col].dtype == "int64":
-                typed_val = int(str(val).strip())
-            elif df[resolved_col].dtype == "float64":
-                typed_val = float(str(val).strip())
+            col_dtype = df[resolved_col].dtype
+            if _dtype_is_int(col_dtype):
+                parsed_num = _parse_human_number(str(val))
+                typed_val = int(parsed_num) if parsed_num is not None else int(str(val).strip().replace(",", ""))
+                if op in {"=", "!="} and _is_token_count_column(resolved_col):
+                    parsed_bin = _parse_human_number_binary_if_applicable(str(val))
+                    if parsed_bin is not None:
+                        typed_val_candidates = [typed_val, int(parsed_bin)]
+            elif _dtype_is_float(col_dtype):
+                parsed_num = _parse_human_number(str(val))
+                typed_val = float(parsed_num) if parsed_num is not None else float(str(val).strip().replace(",", ""))
+                if op in {"=", "!="} and _is_token_count_column(resolved_col):
+                    parsed_bin = _parse_human_number_binary_if_applicable(str(val))
+                    if parsed_bin is not None:
+                        typed_val_candidates = [typed_val, float(parsed_bin)]
             elif df[resolved_col].dtype == "bool":
                 typed_val = str(val).strip().lower() in ("true", "1", "yes", "y", "on")
         except Exception:
             typed_val = val
 
         if op == "=":
-            df = df[df[resolved_col] == typed_val]
+            if typed_val_candidates is not None:
+                df = df[df[resolved_col].isin(typed_val_candidates)]
+            else:
+                df = df[df[resolved_col] == typed_val]
         elif op == "!=":
-            df = df[df[resolved_col] != typed_val]
+            if typed_val_candidates is not None:
+                df = df[~df[resolved_col].isin(typed_val_candidates)]
+            else:
+                df = df[df[resolved_col] != typed_val]
         elif op == ">=":
             try:
-                df = df[df[resolved_col] >= float(typed_val)]
+                df = df[df[resolved_col] >= typed_val]
             except Exception:
                 typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
         elif op == "<=":
             try:
-                df = df[df[resolved_col] <= float(typed_val)]
+                df = df[df[resolved_col] <= typed_val]
             except Exception:
                 typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
         elif op == ">":
             try:
-                df = df[df[resolved_col] > float(typed_val)]
+                df = df[df[resolved_col] > typed_val]
             except Exception:
                 typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
         elif op == "<":
             try:
-                df = df[df[resolved_col] < float(typed_val)]
+                df = df[df[resolved_col] < typed_val]
             except Exception:
                 typer.echo(f"Warning: Invalid value '{val}' for column '{col}'", err=True)
 
@@ -3084,6 +3277,17 @@ def search(
         df_tmp = fd.DataFrame(pdf)
         df_tmp = _apply_filters(df_tmp, filters)
         pdf = df_tmp.to_pandas() if hasattr(df_tmp, 'to_pandas') else pd.DataFrame(df_tmp)
+
+    # If filtering removes all rows, avoid pandas apply/assignment shape issues.
+    if getattr(pdf, "empty", False):
+        display_df = fd.DataFrame(pdf)
+        try:
+            setattr(display_df, "_rich_table_style", style)
+        except Exception:
+            pass
+        columns = _select_columns(display_df, column, add_column, all_columns)
+        _render_table(display_df, columns, limit, title_prefix="Search Results", style=style)
+        return
     q = query.strip()
     if not q:
         raise typer.BadParameter("query must be non-empty")
@@ -3121,7 +3325,7 @@ def search(
         display_df = _apply_sort(display_df, sort)
 
     columns = _select_columns(display_df, column, add_column, all_columns)
-    _render_table(display_df, columns, limit, title_prefix="Search Results")
+    _render_table(display_df, columns, limit, title_prefix="Search Results", style=style)
 
 
 @app.command("list")

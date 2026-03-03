@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Expanded the underlying DataFrame schema to include (best-effort) flattened raw model JSON fields as columns, enabling sorting/filtering/selection on non-default fields (e.g. `last_updated`, `release_date`).
+- Enhanced `--filter` to parse human-readable numeric values (e.g. `1.0M`, `4K`, comma-separated digits) for all numeric columns and to support date comparisons on date-like columns using `dateparser`.
 - Enhanced `--column` to support multi-column expansion aliases (e.g. `model`, `supports`, `cost`) in addition to single-column aliases.
 - Enhanced `--sort` to accept expanded aliases by using the first column of the expansion (e.g. `--sort model` sorts by `model_id`).
 - Added `--sort/-s` to `models search` to optionally re-sort the final filtered result set by a concrete column (default remains fuzzy score ranking).
