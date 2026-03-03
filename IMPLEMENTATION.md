@@ -75,6 +75,12 @@
   - multi-column expansions (e.g. `model -> model_id,model_name`, `supports -> supports_attachments,supports_reasoning,supports_temperature`, `cost -> input_cost,output_cost`).
 - Prefix/suffix normalization (conservative, no fuzzy matching): common variants like `updated_at`, `last_updated_at`, `released_at` are normalized to the stable alias tokens `updated`/`release` before applying alias/expansion rules.
 
+## Default output columns
+
+- Default table output columns are: `provider`, `model_id`, `cost(in/out)`, `context_window`, `model_name`, `last_updated`.
+- When a provider filter is applied via `--provider/-p`, the default output omits the `provider` column for readability.
+- `cost(in/out)` is a synthetic display column rendered as `input_cost / output_cost` (e.g. `0.6 / 3.6`).
+
 ## Sorting
 
 - `--sort` accepts raw column names or aliases.

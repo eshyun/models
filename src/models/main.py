@@ -384,13 +384,22 @@ def get_available_columns() -> List[str]:
 
 def get_default_display_columns() -> List[str]:
     return [
-        'provider',
-        'model_id',
-        'input_cost',
-        'output_cost',
-        'context_window',
-        'max_output_tokens',
-        'model_name',
+        "provider",
+        "model_id",
+        "__cost_in_out__",
+        "context_window",
+        "model_name",
+        "last_updated",
+    ]
+
+
+def get_default_display_columns_without_provider() -> List[str]:
+    return [
+        "model_id",
+        "__cost_in_out__",
+        "context_window",
+        "model_name",
+        "last_updated",
     ]
 
 
@@ -481,7 +490,7 @@ def resolve_column_spec(column: str, available_columns: List[str]) -> List[str]:
         "release": ["release_date"],
         "model": ["model_id", "model_name"],
         "supports": ["supports_attachments", "supports_reasoning", "supports_temperature"],
-        "cost": ["input_cost", "output_cost"],
+        "cost": ["__cost_in_out__"],
         "tokens": ["max_output_tokens"],
         "context": ["context_window"],
         "input": ["input_cost"],
@@ -492,11 +501,16 @@ def resolve_column_spec(column: str, available_columns: List[str]) -> List[str]:
         "cost_cache_read": ["cost_cache_read_per_million"],
     }
 
+    synthetic_columns = {"__cost_in_out__"}
     normalized = {c.lower(): c for c in available_columns}
     if key in specs:
         out: List[str] = []
         seen: set[str] = set()
         for spec_col in specs[key]:
+            if spec_col in synthetic_columns and spec_col.lower() not in seen:
+                seen.add(spec_col.lower())
+                out.append(spec_col)
+                continue
             resolved = resolve_column_alias(spec_col, available_columns)
             resolved = normalized.get(resolved.lower(), resolved)
             if resolved.lower() in normalized and resolved.lower() not in seen:
@@ -819,7 +833,13 @@ def _row_best_rank(query: str, row: Any, fields: List[str], advanced_fuzzy: bool
             best = rank
     return best
 
-def display_results(data: List[Dict], columns: List[str], title: str = "Model Data", style: Optional[str] = None):
+def display_results(
+    data: List[Dict],
+    columns: List[str],
+    title: str = "Model Data",
+    style: Optional[str] = None,
+    column_labels: Optional[Dict[str, str]] = None,
+):
     """Display results in a formatted table.
     
     Args:
@@ -837,6 +857,11 @@ def display_results(data: List[Dict], columns: List[str], title: str = "Model Da
     except ImportError:
         pd = None
 
+    try:
+        from rich.text import Text
+    except Exception:
+        Text = None
+
     console = Console()
     resolved_box = resolve_rich_table_box(style)
     if _is_plain_table_style(style):
@@ -846,18 +871,44 @@ def display_results(data: List[Dict], columns: List[str], title: str = "Model Da
     else:
         table = Table(title=title, show_header=True, header_style="bold magenta")
     
+    labels = column_labels or {}
+
     # Add columns
     for col in columns:
-        table.add_column(col, overflow="fold")
+        table.add_column(labels.get(col, col), overflow="fold")
     
     # Add rows
     for row in data:
         formatted_row = []
         for col in columns:
             value = row.get(col, None)
+
+            # Special rendering for synthetic cost column: apply color styling
+            # at render-time without storing Rich objects in the DataFrame.
+            if col == "__cost_in_out__" and Text is not None and isinstance(value, str) and "/" in value:
+                left_part, right_part = value.split("/", 1)
+                t = Text()
+                t.append(left_part.rstrip(), style="cyan")
+                t.append(" / ", style="dim")
+                # Preserve leading spaces in right_part for right alignment.
+                t.append(right_part, style="green")
+                formatted_row.append(t)
+                continue
+
+            # Preserve rich renderables (e.g., Text) as-is.
+            if Text is not None and isinstance(value, Text):
+                formatted_row.append(value)
+                continue
             
             # Handle NaN/None values
-            if value is None or (pd and pd.isna(value)) or value == '':
+            is_nan = False
+            if pd is not None and value is not None:
+                try:
+                    is_nan = bool(pd.isna(value))
+                except Exception:
+                    is_nan = False
+
+            if value is None or is_nan or value == '':
                 formatted_row.append("N/A")
                 continue
                 
@@ -955,6 +1006,7 @@ def _root(
 def _validate_columns(values: Optional[List[str]], available: List[str]) -> Optional[List[str]]:
     if not values:
         return values
+    synthetic_columns = {"__cost_in_out__"}
     normalized = {c.lower(): c for c in available}
     resolved: List[str] = []
     invalid: List[str] = []
@@ -962,11 +1014,20 @@ def _validate_columns(values: Optional[List[str]], available: List[str]) -> Opti
     for v in values:
         raw = (v or "").strip()
         key = raw.lower()
+        matched = False
         for resolved_col in resolve_column_spec(key, available):
-            if resolved_col and resolved_col.lower() in normalized:
+            if not resolved_col:
+                continue
+            if resolved_col in synthetic_columns:
+                resolved.append(resolved_col)
+                matched = True
+                continue
+            if resolved_col.lower() in normalized:
                 resolved.append(normalized[resolved_col.lower()])
-            else:
-                invalid.append(v)
+                matched = True
+                continue
+        if not matched:
+            invalid.append(v)
 
     if invalid:
         raise typer.BadParameter(
@@ -1373,6 +1434,7 @@ def _select_columns(
     column: Optional[List[str]],
     add_column: Optional[List[str]],
     all_columns: bool,
+    provider_filter_applied: bool = False,
 ) -> List[str]:
     base_columns: List[str]
     if all_columns:
@@ -1402,7 +1464,11 @@ def _select_columns(
                 expanded.append(c)
         base_columns = _validate_columns(expanded, df.columns.tolist())
     else:
-        base_columns = get_default_display_columns()
+        base_columns = (
+            get_default_display_columns_without_provider()
+            if provider_filter_applied
+            else get_default_display_columns()
+        )
 
     # Additive columns: extend base output, preserving order and dedup.
     if add_column:
@@ -1430,7 +1496,8 @@ def _select_columns(
     else:
         columns = list(base_columns or [])
 
-    available_cols = set(df.columns)
+    synthetic_columns = {"__cost_in_out__"}
+    available_cols = set(df.columns).union(synthetic_columns)
     valid_columns = [col for col in columns if col in available_cols]
 
     invalid_columns = [col for col in columns if col not in available_cols]
@@ -1482,10 +1549,59 @@ def _render_table(
     title_prefix: str = "Model Data",
     style: Optional[str] = None,
 ):
+    base_cols = [c for c in columns if c != "__cost_in_out__"]
+    required = list(base_cols)
+    if "__cost_in_out__" in columns:
+        for dep in ("input_cost", "output_cost"):
+            if dep in df.columns and dep not in required:
+                required.append(dep)
+
     if limit is not None and int(limit) > 0:
-        display_df = df[columns].head(int(limit)).copy()
+        display_df = df[required].head(int(limit)).copy()
     else:
-        display_df = df[columns].copy()
+        display_df = df[required].copy()
+
+    column_labels: Dict[str, str] = {
+        "provider": "provider",
+        "model_id": "id",
+        "__cost_in_out__": "cost(in/out)",
+        "context_window": "context",
+        "model_name": "name",
+        "last_updated": "updated",
+    }
+
+    if "__cost_in_out__" in columns:
+        def _cell_cost_in(row: Any) -> str:
+            v = row.get("input_cost") if hasattr(row, "get") else None
+            return format_cost(v)
+
+        def _cell_cost_out(row: Any) -> str:
+            v = row.get("output_cost") if hasattr(row, "get") else None
+            return format_cost(v)
+
+        left_series = display_df.apply(_cell_cost_in, axis=1).astype(str)
+        right_series = display_df.apply(_cell_cost_out, axis=1).astype(str)
+        try:
+            max_left_width = int(left_series.map(len).max())
+        except Exception:
+            max_left_width = 0
+        try:
+            max_right_width = int(right_series.map(len).max())
+        except Exception:
+            max_right_width = 0
+
+        def _fmt_cost_pair_aligned(idx: Any) -> str:
+            left = left_series.loc[idx]
+            right = right_series.loc[idx]
+            if left == "N/A" and right == "N/A":
+                return "N/A"
+            left_s = str(left).rjust(max_left_width)
+            right_s = str(right).rjust(max_right_width)
+            return f"{left_s} / {right_s}"
+
+        display_df["__cost_in_out__"] = [
+            _fmt_cost_pair_aligned(i) for i in display_df.index
+        ]
 
     for col in display_df.columns:
         if display_df[col].dtype == 'float64':
@@ -1493,12 +1609,15 @@ def _render_table(
         elif display_df[col].dtype == 'int64':
             display_df[col] = display_df[col].astype('Int64')
 
+    display_df = display_df[[c for c in columns if c in display_df.columns]].copy()
+
     display_data = display_df.to_dict('records')
     display_results(
         display_data,
-        columns,
+        [c for c in columns if c in display_df.columns],
         f"{title_prefix} (showing {len(display_data)} of {len(df)} models)",
         style=style or getattr(df, "_rich_table_style", None),
+        column_labels=column_labels,
     )
 
 
@@ -1522,15 +1641,18 @@ def _list_models(
     except Exception:
         pass
 
+    provider_filter_applied = False
+
     # Provider shortcut
     if provider:
         providers = _parse_provider_values(provider)
         df = _filter_df_by_providers(df, providers, partial=provider_partial)
+        provider_filter_applied = True
 
     df = _apply_filters(df, filters)
     df = _apply_sort(df, sort)
 
-    columns = _select_columns(df, column, add_column, all_columns)
+    columns = _select_columns(df, column, add_column, all_columns, provider_filter_applied=provider_filter_applied)
     _render_table(df, columns, limit, style=style)
 
 
@@ -3268,9 +3390,11 @@ def search(
 ):
     """Fuzzy search models by model_id/model_name (sorted by fuzzy score desc)."""
     pdf = _load_pdf()
+    provider_filter_applied = False
     if provider:
         providers = _parse_provider_values(provider)
         pdf = _filter_pdf_by_providers(pdf, providers, partial=provider_partial)
+        provider_filter_applied = True
 
     # Apply extra filters using the same filter syntax by temporarily converting to fd.DataFrame
     if filters:
@@ -3285,7 +3409,13 @@ def search(
             setattr(display_df, "_rich_table_style", style)
         except Exception:
             pass
-        columns = _select_columns(display_df, column, add_column, all_columns)
+        columns = _select_columns(
+            display_df,
+            column,
+            add_column,
+            all_columns,
+            provider_filter_applied=provider_filter_applied,
+        )
         _render_table(display_df, columns, limit, title_prefix="Search Results", style=style)
         return
     q = query.strip()
@@ -3324,7 +3454,13 @@ def search(
     if sort:
         display_df = _apply_sort(display_df, sort)
 
-    columns = _select_columns(display_df, column, add_column, all_columns)
+    columns = _select_columns(
+        display_df,
+        column,
+        add_column,
+        all_columns,
+        provider_filter_applied=provider_filter_applied,
+    )
     _render_table(display_df, columns, limit, title_prefix="Search Results", style=style)
 
 

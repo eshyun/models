@@ -84,6 +84,12 @@ Filter results:
 models -f "provider=openai"
 ```
 
+Default table columns:
+
+- When listing normally, the default table shows: `provider`, `id`, `cost(in/out)`, `context`, `name`, `updated`.
+- When `--provider/-p` is used (i.e. provider filter is applied), the default output omits the `provider` column.
+- `cost(in/out)` is rendered as `input_cost / output_cost` and aligns the separator across rows; when your terminal supports it, the input/output sides are displayed in different colors and the separator is shown in a dim color.
+
 Filter syntax notes:
 
 - Operators support optional spaces (e.g. `provider ~= openrou`).
@@ -99,7 +105,7 @@ Filter syntax notes:
   - `release` -> `release_date`
     - Also accepts common variants like `released`, `released_at`, `release_at`.
   - `supports` -> `supports_attachments`, `supports_reasoning`, `supports_temperature`
-  - `cost` -> `input_cost`, `output_cost`
+  - `cost` -> `cost(in/out)` (combined)
   - `input` -> `input_cost`
   - `output` -> `output_cost`
   - `context` -> `context_window`

@@ -241,6 +241,31 @@ def test_add_column_appends_to_default_output_and_allows_hidden_nested_cols():
     cols2 = m._select_columns(df, column=["model"], add_column=["updated"], all_columns=False)
     assert cols2 == ["model_id", "model_name", "last_updated"]
 
+    # cost expansion should now map to the synthetic cost(in/out) column
+    cols3 = m._select_columns(df, column=["cost"], add_column=None, all_columns=False)
+    assert cols3 == ["__cost_in_out__"]
+
+
+def test_default_columns_omit_provider_when_provider_filter_applied():
+    m = _import_main()
+    pdf = pd.DataFrame(
+        [
+            {
+                "provider": "p",
+                "model_id": "a",
+                "model_name": "A",
+                "input_cost": 1.0,
+                "output_cost": 2.0,
+                "context_window": 100,
+                "last_updated": "2025-01-01",
+            }
+        ]
+    )
+    df = m.fd.DataFrame(pdf)
+
+    cols = m._select_columns(df, column=None, add_column=None, all_columns=False, provider_filter_applied=True)
+    assert cols == m.get_default_display_columns_without_provider()
+
 
 def test_normalize_query_llm_naming_separators_and_digits():
     m = _import_main()
@@ -465,7 +490,7 @@ def test_limit_zero_means_no_limit(monkeypatch):
 
     captured = {}
 
-    def fake_display_results(data, cols, title, style=None):
+    def fake_display_results(data, cols, title, style=None, column_labels=None):
         captured["data"] = data
         captured["cols"] = cols
         captured["title"] = title
@@ -501,6 +526,57 @@ def test_style_plain_is_supported_and_renders_without_box_chars():
 
     assert captured["kwargs"].get("box") is None
     assert captured["kwargs"].get("show_edge") is False
+
+
+def test_cost_in_out_alignment_pads_left_side_to_align_slash(monkeypatch):
+    m = _import_main()
+    df = m.fd.DataFrame(
+        pd.DataFrame(
+            [
+                {
+                    "provider": "p",
+                    "model_id": "a",
+                    "model_name": "A",
+                    "input_cost": 0.2,
+                    "output_cost": 1.1,
+                },
+                {
+                    "provider": "p",
+                    "model_id": "b",
+                    "model_name": "B",
+                    "input_cost": 0.04,
+                    "output_cost": 0.16,
+                },
+                {
+                    "provider": "p",
+                    "model_id": "c",
+                    "model_name": "C",
+                    "input_cost": 0,
+                    "output_cost": 0,
+                },
+            ]
+        )
+    )
+
+    captured = {}
+
+    def fake_display_results(data, cols, title, style=None, column_labels=None):
+        captured["data"] = data
+        captured["cols"] = cols
+
+    monkeypatch.setattr(m, "display_results", fake_display_results)
+    m._render_table(df, columns=["__cost_in_out__"], limit=0, title_prefix="Test")
+
+    rows = captured["data"]
+    assert len(rows) == 3
+    rendered = [str(r["__cost_in_out__"]) for r in rows]
+    slash_positions = [s.index("/") for s in rendered if "/" in s]
+    assert len(set(slash_positions)) == 1
+
+    # Ensure right side is right-aligned: after the bullet, there should be at least one leading space
+    # in rows where the numeric length is shorter.
+    right_parts = [s.split("/", 1)[1] for s in rendered]
+    assert any(part.startswith(" ") for part in right_parts)
 
 
 def test_fetch_data_ttl_zero_forces_remote(monkeypatch, tmp_path):

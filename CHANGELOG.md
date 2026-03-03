@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Changed default table output columns across list/search to: provider, id, cost(in/out), context, name, updated.
+- When a provider filter is applied via `--provider/-p`, the default output omits the `provider` column.
+- Combined `input_cost` and `output_cost` into a synthetic `cost(in/out)` column in the default output.
+
 - Expanded the underlying DataFrame schema to include (best-effort) flattened raw model JSON fields as columns, enabling sorting/filtering/selection on non-default fields (e.g. `last_updated`, `release_date`).
 - Enhanced `--filter` to parse human-readable numeric values (e.g. `1.0M`, `4K`, comma-separated digits) for all numeric columns and to support date comparisons on date-like columns using `dateparser`.
 - Enhanced `--column` to support multi-column expansion aliases (e.g. `model`, `supports`, `cost`) in addition to single-column aliases.
